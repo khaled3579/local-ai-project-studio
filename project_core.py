@@ -363,6 +363,7 @@ class Workspace:
                 self.running.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.running.kill()
+                self.running.wait(timeout=5)
         if self.run_log:
             self.run_log.close()
             self.run_log = None

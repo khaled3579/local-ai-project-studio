@@ -220,7 +220,7 @@
   let lastProject=null;
   const previousRender=render;
   render=function(s){
-    if(lastProject!==null&&lastProject!==s.project){cache();drafts.flush();serial++;opening=false;file=null;fileProject=null;qualityData=null;qualityKey='';for(const id of ['qualityState','qualityLayers','qualityTests','qualityFailures'])$(id).textContent='—';$('qualityNote').textContent='جارٍ تحميل تقرير المشروع الحالي…';$('codeEditor').value='';$('codeEditor').disabled=true;$('editorPath').textContent='اختر ملفًا من المشروع الحالي';$('editorDiff').replaceChildren();$('qualityChecks').replaceChildren();$('downloadQuality').hidden=true;}
+    if(lastProject!==null&&lastProject!==s.project){cache();drafts.flush();serial++;opening=false;file=null;fileProject=null;qualityData=null;qualityKey='';for(const id of ['qualityState','qualityLayers','qualityTests','qualityFailures'])$(id).textContent='—';$('qualityNote').textContent='جارٍ تحميل تقرير المشروع الحالي…';$('codeEditor').value='';$('codeEditor').disabled=true;$('editorPath').textContent='اختر ملفًا من المشروع الحالي';$('editorDiff').replaceChildren();$('qualityChecks').replaceChildren();$('downloadQuality').hidden=true;qualityBusy=false;qualityURL=null;comparedDiskHash=null;fileListKey='';previewURL=null;$('projectFrame').removeAttribute('src');setView('chat');}
     if(draftsProject!==s.project){draftsProject=s.project;dirtyPaths.clear();for(const f of s.files){const d=drafts.read(s.project,f.path);if(d&&d.text!==d.base.replace(/\r\n/g,'\n'))dirtyPaths.add(f.path);}}
     lastProject=s.project;previousRender(s);heading();updateControls();
     const key=JSON.stringify([s.project,s.files.filter(f=>/\.html?$/i.test(f.path)).map(f=>f.path)]);

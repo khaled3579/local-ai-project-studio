@@ -116,6 +116,8 @@ class Studio:
         self.lock = threading.RLock()
         self.live_generation = None
         self.workspace = None
+        self.workspace_instance = uuid.uuid4().hex
+        self.workspace_epoch = 0
         self.job = None
         self.events = []
         self.messages = []
@@ -943,8 +945,6 @@ class Studio:
                 raise ValueError("أدخل مسار مجلد المشروع أولًا.")
             if self.busy():
                 raise ValueError("انتظر انتهاء المهمة قبل تغيير المشروع.")
-            if self.workspace and self.workspace.running and self.workspace.running.poll() is None:
-                raise ValueError("أوقف تطبيق المشروع الحالي قبل الانتقال إلى مشروع آخر.")
             root = Path(path).expanduser()
             if not root.is_absolute():
                 raise ValueError("أدخل مسارًا مطلقًا للمجلد.")
@@ -952,9 +952,25 @@ class Studio:
                 if root.exists():
                     raise FileExistsError("المجلد موجود بالفعل. استخدم فتح المجلد أو اختر اسمًا جديدًا.")
                 root.mkdir(parents=True, exist_ok=False)
+            root = root.resolve()
+            if self.workspace and root == self.workspace.root:
+                if not self.picking:
+                    self.folder_pick = None
+                return str(root)
+            # Validate the destination before touching the current application's state.
             workspace = Workspace(root, self.event)
-            if self.workspace and hasattr(self.workspace,'assistant_tools'):self.workspace.assistant_tools.browser.close()
+            if self.workspace:
+                self.workspace.stop()
+                if self.workspace.running and self.workspace.running.poll() is None:
+                    raise ValueError("تعذر إيقاف معاينة المشروع السابق؛ لم يتغير المشروع.")
             self.workspace = workspace
+            self.workspace_epoch += 1
+            if not self.picking:
+                self.folder_pick = None
+            self.live_generation = None
+            self.chain_stop.clear()
+            self.chain_pause.clear()
+            self.startup_recovery = {"status": "project_selected", "project": str(root)}
             self.repair_run = None
             self.events = []
             self.job = None
@@ -981,6 +997,12 @@ class Studio:
                     self.last_completed_project = str(workspace.root)
             self.save_project_settings()
         return str(workspace.root)
+
+    def require_project(self, value):
+        if not self.workspace or (value.get('project') is not None and value['project'] != str(self.workspace.root)):
+            raise ValueError("تغير المشروع؛ أعد فتح الملف من المشروع الحالي.")
+        if value.get('session_id') is not None and value['session_id'] != self.session_id:
+            raise ValueError("تغيرت المحادثة؛ أعد المحاولة في المحادثة الحالية.")
 
     def save_project_settings(self):
         write_json(self.settings_path, {'project': str(self.workspace.root), 'recent': self.recent,
@@ -1027,6 +1049,7 @@ class Studio:
             workspace = self.workspace
             running = workspace.running if workspace else None
             return {"app": "daily-project-studio", "project": str(workspace.root) if workspace else None,
+                    "workspace_instance": self.workspace_instance, "workspace_epoch": self.workspace_epoch,
                     "vision": self.vision,
                     "tools_busy": self.tools_busy,
                     "has_context_summary": bool(workspace and self.active_session().get("handoff")),
@@ -1980,6 +2003,7 @@ class Handler(BaseHTTPRequestHandler):
                 with STUDIO.lock:
                     if STUDIO.busy():
                         raise ValueError("انتظر انتهاء المهمة قبل تحرير الملفات")
+                    STUDIO.require_project(value)
                     result = STUDIO.workspace.write(value["path"], value["content"], value["sha256"])
                 self.send(result)
                 return
@@ -2001,7 +2025,10 @@ class Handler(BaseHTTPRequestHandler):
                 if STUDIO.job:
                     STUDIO.job["cancel_requested"] = True
             elif self.path == "/api/read":
-                self.send(STUDIO.workspace.read(value["path"]))
+                with STUDIO.lock:
+                    STUDIO.require_project(value)
+                    result = STUDIO.workspace.read(value["path"])
+                self.send(result)
                 return
             elif self.path == "/api/run":
                 with STUDIO.lock:
