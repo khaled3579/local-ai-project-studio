@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "python": "3.13-x64",
+  "node": "v26.11.1",
+  "packages": {
+    "certifi": "2026.2.25",
+    "charset-normalizer": "3.4.2",
+    "idna": "3.18",
+    "pillow": "12.2.0",
+    "psutil": "7.0.0",
+    "pypdf": "6.21.0",
+    "requests": "2.32.4",
+    "urllib3": "2.6.3"
+  },
+  "wheels": {
+    "certifi-2026.2.25-py3-none-any.whl": "027692e4402ad994f1c42e52a4997a9763c646b73e4096e4d5d6db8af1d6f0fa",
+    "charset_normalizer-3.4.2-cp313-cp313-win_amd64.whl": "aa6af9e7d59f9c12b33ae4e9450619cf2488e2bbe9b44030905877f0b2324980",
+    "idna-3.18-py3-none-any.whl": "7f952cbe720b688055e3f87de14f5c3e5fdaa8bc3928985c4077ca689de849a2",
+    "pillow-12.2.0-cp313-cp313-win_amd64.whl": "390ede346628ccc626e5730107cde16c42d3836b89662a115a921f28440e6a3b",
+    "psutil-7.0.0-cp37-abi3-win_amd64.whl": "4cf3d4eb1aa9b348dec30105c55cd9b7d4629285735a102beb4441e38db90553",
+    "pypdf-6.21.0-py3-none-any.whl": "3aec619699dacb1b73f57e87d9adaa4424814517b2cc028de20adba5a37af4c4",
+    "requests-2.32.4-py3-none-any.whl": "27babd3cda2a6d50b30443204ee89830707d396671944c998b5975b031ac2b2c",
+    "urllib3-2.6.3-py3-none-any.whl": "bf272323e553dfb2e87d9bfd225ca7b0f467b919d7bbd355436d3fd37cb0acd4"
+  },
+  "requirements_sha256": "6c55e2ecefb9db9106e0fba9558eb6a414399ebf8278494ebfc1a7c01618e917"
+}

@@ -1,0 +1,21 @@
+# Local user data and generated files
+daily/
+.local-ai/
+.environments/
+.updates/
+.update-journal.json
+.environment-setup.lock
+runtime/
+wheelhouse/
+Projects/
+work/
+__pycache__/
+*.pyc
+*.log
+*.sqlite*
+*.db
+*.pid
+*.zip
+*.sha256
+.env
+.env.*

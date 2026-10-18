@@ -1,0 +1,13 @@
+'use strict';
+const fs=require('node:fs'),path=require('node:path');
+const ts=require('./runtime/assistant/node_modules/typescript');
+const input=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));const root=fs.realpathSync(input.root);
+const runtime=fs.realpathSync(path.join(__dirname,'runtime/assistant/node_modules/typescript'));
+const inside=(file,base)=>{const rel=path.relative(base,file);return rel===''||(!rel.startsWith('..')&&!path.isAbsolute(rel));};
+const options={allowJs:true,checkJs:true,noEmit:true,skipLibCheck:true,target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.NodeNext,moduleResolution:ts.ModuleResolutionKind.NodeNext,strict:false,jsx:ts.JsxEmit.ReactJSX};
+const host=ts.createCompilerHost(options);const read=host.readFile;
+host.readFile=file=>{try{const real=fs.realpathSync(file);if((inside(real,root)||inside(real,runtime))&&fs.statSync(real).size<2*1024*1024)return read(real);}catch{}return undefined;};
+const files=input.files.map(f=>path.resolve(root,f));if(files.some(f=>!inside(f,root)))throw Error('Path outside project');
+const program=ts.createProgram(files,options,host);const diagnostics=ts.getPreEmitDiagnostics(program);
+const rows=diagnostics.slice(0,150).map(d=>{const pos=d.file&&d.start!==undefined?d.file.getLineAndCharacterOfPosition(d.start):null;return {file:d.file?path.relative(root,d.file.fileName):null,line:pos?pos.line+1:null,column:pos?pos.character+1:null,severity:d.category===ts.DiagnosticCategory.Error?'error':'warning',code:d.code,message:ts.flattenDiagnosticMessageText(d.messageText,'\n')};});
+process.stdout.write(JSON.stringify({summary:{errorCount:diagnostics.filter(d=>d.category===ts.DiagnosticCategory.Error).length,files:files.length},diagnostics:rows,truncated:diagnostics.length>150,profile:'noEmit + checkJs, no project plugins or build scripts'}));
