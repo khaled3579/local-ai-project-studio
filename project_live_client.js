@@ -74,7 +74,19 @@
       ? 'أدلة القبول · ' + acceptanceEvidence.requirements_coverage.items.filter(row => row.passed).length + '/' + acceptanceEvidence.requirements_coverage.items.length
       : 'أدلة القبول';
     const old = $('liveGeneration');
-    if (!same || !packet.generation || packet.job?.status !== 'running') {
+    if (!same) { old?.remove(); return; }
+    if (!packet.generation || packet.job?.status !== 'running') {
+      // Keep the last visible stream until the durable snapshot has caught up.
+      // A completed stream is not itself a persisted conversation message.
+      const saved = old && state.messages?.some(message => message.generation_id === old.dataset.generationId);
+      if (saved || !old?.children[1]?.textContent?.trim()) old?.remove();
+      else if (old) {
+        old.children[0].textContent = 'المساعد';
+        old.children[2].textContent = 'آخر رد ظاهر · جارٍ تحديث سجل المحادثة';
+      }
+      return;
+    }
+    if (state.messages?.some(message => message.generation_id === packet.generation.id && message.kind !== 'partial')) {
       old?.remove(); return;
     }
     const nearBottom = $('chat').scrollHeight - $('chat').scrollTop - $('chat').clientHeight < 140;
@@ -86,12 +98,14 @@
       const note = document.createElement('small'); note.className = 'hint';
       box.append(title, body, note); $('chat').append(box);
     }
+    box.dataset.generationId = packet.generation.id;
+    box.children[0].textContent = 'المساعد · يولّد الآن';
     // Never parse unfinished Markdown/HTML or tool JSON as executable content.
     box.children[1].textContent = packet.generation.text || 'جارٍ تجهيز الرد…';
     box.children[2].textContent = packet.generation.tools?.filter(Boolean).length
       ? 'تجهيز الأدوات: ' + packet.generation.tools.filter(Boolean).join('، ') + ' · التنفيذ بعد اكتمال الرد'
       : 'عرض أثناء التوليد · يعتمد التسليم على الفحص النهائي';
-    if (nearBottom || !old) $('chat').scrollTop = $('chat').scrollHeight;
+    if (nearBottom) $('chat').scrollTop = $('chat').scrollHeight;
   }
   const previousRender = render;
   render = function (s) { previousRender(s); paint(latest); };

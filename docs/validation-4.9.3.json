@@ -1,0 +1,52 @@
+{
+  "version": "4.9.3",
+  "new_tests_run_for_this_publication": 0,
+  "new_model_generations": 0,
+  "evidence": "Reused historical receipts and source hashes; no checks or tests rerun for publication.",
+  "chat_fix_4_9_2": {
+    "recorded_type_checked_files": 17,
+    "recorded_type_errors": 0,
+    "recorded_type_warnings": 0,
+    "recorded_javascript_syntax_errors": 0,
+    "actual_existing_conversation_observed": true,
+    "visual_browser_verification": false
+  },
+  "startup_fix_4_9_3": {
+    "ports": [
+      18078,
+      18079,
+      18080
+    ],
+    "protocol": "TCP IPv4 and IPv6",
+    "recorded_windows_powershell_parser": "passed",
+    "port_release_runtime_test_executed": false
+  },
+  "type_checked_source_sha256": {
+    "project_studio.py": "0477d8c08c67bff3fcb8310860c08bdc65551ab2712ca236992bc38470343937",
+    "project_core.py": "638307462962e4767a650701fdebb989fa23503fe27f9ea9f049c46c3a101afe",
+    "project_browser_tools.py": "b09395d962d90d49a58f50539681a81f60263ad3724f9a993b0687d18dfbd7d9",
+    "project_recovery.py": "e89f930df282c0f58e4e43c5df70ea0a4d4b2139c4524f5fdf21b6724c715418",
+    "project_quality.py": "02593d2773407d32b8754699bb44adaff429b1edcc5a47611008971a2c0fa598",
+    "project_quality_contract.py": "89c8debbc4517a9cf197de7ac444dac4790bf1e1e7ffd38c8258f58f4f2d0f35",
+    "project_validation.py": "c6b5f97c5291bb4493989659a13294fca141b1d3bd8f35a62f4b6286ebabc936",
+    "project_performance.py": "8b6e0c541c68542b3057a9589350f02ce9eb1de559a44fe18fb8a4a7db011fcc",
+    "project_source_guard.py": "6cb494466da59b1b009628810dba7ca36e7bd93066d4c237d4a77e207432a769",
+    "project_acceptance_contract.py": "90f640e6fe973ccbf74b0573eb7a5cf90fa3c3f37db46f0d9c9b1cbe4a956f8a",
+    "project_acceptance.py": "fa2227257b087e1b88d7f25bc8012b87d9bd22b89abab78401cd179d1f58fe5f",
+    "project_acceptance_bindings.py": "3a930e62e0f5591af36b03c719d1196d25da86aebd4b02a2e6b9f6fcbdb1422f",
+    "project_acceptance_targets.py": "6c8c2abebfef06bcec9ae7935f2e323a40621ba30a456ee6ec9936798174ec5f",
+    "project_context.py": "bd466d62bf037a29553bb2b55081dd1be2cb96beef005f4b8b1d9aa459f8be2a",
+    "project_loop_guard.py": "342b0051afbff2c369b3bd1973678ac48830df86e49db365cc2434bb1a9f7ad1",
+    "project_test_suggestions.py": "317b648ee50d35df77c54b8ed03e650c52116833f6778a0040c8748b0b94b7c5",
+    "project_conversation.py": "e9e7b3871d38d17530876bef372064e18bf7e351e0162b943b402e1fdd327bb2"
+  },
+  "startup_file_sha256": {
+    "Start.cmd": "128c48d3cea412e643d86dc8e3615ae93c4f8a9d0c48192713afd36940e3853a",
+    "Start-All.ps1": "7855266e5996909c68ada3bfa328ba02bfceba979fb365a2d714bd700248b80f"
+  },
+  "limitations": [
+    "No new functional, concurrency, fault-injection or privilege tests.",
+    "No new token savings or performance claim.",
+    "No user state or binary runtime ZIP is published."
+  ]
+}

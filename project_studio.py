@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -41,6 +42,7 @@ from project_inference import count_messages
 from project_quality import delivery_evidence
 from project_acceptance import Acceptance, ACCEPTANCE_TOOL, host_evidence
 from project_file_context import observe_read, observe_mutation, require_complete_read
+from project_conversation import assistant_entry, conversation_view
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "daily"
@@ -168,6 +170,8 @@ class Studio:
         self.startup_recovery = {"status": "not_started"}
         self.startup_checked = False
         self.repair_run = None
+        self.chat_recovery_cache = None
+        self.chat_history_warning = ''
         try:
             config = json.loads(self.settings_path.read_text(encoding="utf-8"))
             self.recent = config.get("recent", [])
@@ -869,6 +873,53 @@ class Studio:
                     session["messages"] = self.messages
             write_json(self.workspace.meta / "sessions.json", {"active": self.session_id, "sessions": self.sessions})
 
+    def save_assistant_message(self, message, *, kind='progress', verified=False, generation_id=None):
+        """Save visible assistant output before clearing its transient stream."""
+        with self.lock:
+            job = self.require_job()
+            entry = assistant_entry(job['id'], message, kind=kind, generation_id=generation_id)
+            if entry is None:
+                return
+            existing = next((row for row in self.messages if row.get('id') == entry['id']), None)
+            if existing is None:
+                existing = entry
+                self.messages.append(existing)
+            else:
+                existing.update(entry)
+            if kind == 'final':
+                existing.update(kind='final', verified=verified, transcript_only=False)
+            self.save_chat()
+
+    def save_partial_generation(self):
+        generation = self.live_generation
+        if generation and generation.get('text'):
+            self.save_assistant_message({'content': generation['text']}, kind='partial',
+                                        generation_id=generation['id'])
+
+    def visible_messages(self):
+        workspace = self.workspace
+        if workspace is None:
+            return []
+        path = workspace.meta / 'recovery/progress.sqlite3'
+        if path.exists():
+            try:
+                paths = (path, path.with_name(path.name + '-wal'))
+                key = (str(workspace.root), tuple((p.stat().st_mtime_ns, p.stat().st_size) if p.exists() else None for p in paths))
+                cached = self.chat_recovery_cache
+                if cached is None or cached[0] != key:
+                    states = self.recovery().states()
+                    self.chat_recovery_cache = (key, states)
+                else:
+                    states = cached[1]
+                self.chat_history_warning = ''
+            except (OSError, ValueError, sqlite3.Error) as error:
+                self.chat_history_warning = 'تعذّر عرض بعض الرسائل من سجل الاستعادة: ' + str(error)
+                states = []
+        else:
+            states = []
+            self.chat_history_warning = ''
+        return conversation_view(self.sessions, self.session_id, states)
+
     def draft_store(self):
         workspace = self.require_workspace()
         if not hasattr(workspace, 'composer_store'):
@@ -1142,7 +1193,8 @@ class Studio:
                     "composer_draft": self.composer_draft() if workspace else None,
                     "recent": self.recent, "session_id": self.session_id,
                     "sessions": [{"id": s["id"], "title": s["title"], "count": len(s["messages"]), "parent_id": s.get("parent_id"), "continuation_number": s.get("continuation_number", 0)} for s in self.sessions],
-                    "files": workspace.files() if workspace else [], "messages": list(self.messages),
+                    "files": workspace.files() if workspace else [], "messages": self.visible_messages(),
+                    "chat_history_warning": self.chat_history_warning,
                     "events": self.events[-120:], "job": self.job.copy() if self.job else None,
                     "validation": workspace.last_validation() if workspace and not self.busy() else None,
                     "running_pid": running.pid if running and running.poll() is None else None,
@@ -1494,6 +1546,7 @@ class Studio:
                 generation_state.update(protocol='json', retries=generation_state['retries'] + 1)
                 self.event('generation_replanned', {'protocol':'json', 'reason':type(transport_error).__name__, 'detail':str(transport_error), 'retry':generation_state['retries']})
                 self.autosave(prompt, attachment_ids, state_for(step))
+                self.save_partial_generation()
                 live_generation.update(text='', tools=[])
                 if self.chain_pause.wait(.25):
                     raise GenerationInterrupted()
@@ -1806,7 +1859,8 @@ class Studio:
             nonlocal messages, model_prompt, repair_attempts, final
             nonlocal pending_response, requested_images, context, current_step, resume_step
             store = self.attachment_store()
-            history = [{"role": m["role"], "content": m["content"] + ("\nEarlier attachments (read_attachment): " + json.dumps([{k: a[k] for k in ("id", "name", "kind")} for a in m["attachments"]], ensure_ascii=False) if m.get("attachments") else "")} for m in self.messages[-9:-1]]
+            model_history = [m for m in self.messages if not m.get('transcript_only')]
+            history = [{"role": m["role"], "content": m["content"] + ("\nEarlier attachments (read_attachment): " + json.dumps([{k: a[k] for k in ("id", "name", "kind")} for a in m["attachments"]], ensure_ascii=False) if m.get("attachments") else "")} for m in model_history[-9:-1]]
             model_prompt = store.model_content(prompt, attachment_ids or [])
             messages = [{"role": "system", "content": system_prompt}, *history,
                         {"role": "user", "content": model_prompt}]
@@ -1862,6 +1916,7 @@ class Studio:
                     generation_id = uuid.uuid4().hex
                     started_generation = time.time()
                     last_emit = [0.0]
+                    self.save_partial_generation()
                     live_generation = {'id':generation_id, 'job_id':job['id'], 'text':'', 'tools':[], 'started':started_generation}
                     self.live_generation = live_generation
                     def update_stream(text, tools):
@@ -1903,6 +1958,10 @@ class Studio:
                         continue
                     job['last_generation'] = {'seconds':time.time()-started_generation,
                         'first_token_seconds':live_generation.get('first_token_seconds')}
+                    if choice.get('finish_reason') == 'length':
+                        self.save_partial_generation()
+                    else:
+                        self.save_assistant_message(choice['message'], generation_id=generation_id)
                     self.live_generation = None
                     message = choice["message"]
                     if choice.get('finish_reason') == 'length':
@@ -1968,14 +2027,14 @@ class Studio:
                 raise GenerationInterrupted()
             with self.lock:
                 job.update(status="complete", phase="اكتمل الرد دون تعديل المشروع" if read_only else "تم التحقق من المشروع", verified=not read_only, delivery_kind='conversation' if read_only else 'project', finished=time.time())
-                self.messages.append({"role": "assistant", "content": final, "verified": not read_only})
-                self.save_chat()
+                self.save_assistant_message({'content': final}, kind='final', verified=not read_only)
                 if not read_only:
                     self.remember_completed_project()
             self.event("conversation_answered" if read_only else "delivered", {} if read_only else {"files": workspace.files(), "validation": workspace.last_validation()})
         try:
             run_steps()
         except GenerationInterrupted:
+            self.save_partial_generation()
             self.live_generation = None
             if job.get('cancel_requested') or self.chain_stop.is_set():
                 job.update(status='cancelled', phase='أُلغيت المهمة؛ الملفات المكتملة محفوظة', verified=False, finished=time.time())
@@ -1986,6 +2045,7 @@ class Studio:
             self.pause_checkpoint('within_attempt', prompt, attachment_ids, state_for(resume_step, pending_response))
             return 'paused'
         except requests.RequestException as error:
+            self.save_partial_generation()
             self.live_generation = None
             job['transport_error'] = str(error)
             self.event('stream_unavailable', {'message':str(error)})
@@ -2003,6 +2063,7 @@ class Studio:
                 prompt=prompt, attachment_ids=attachment_ids, state_for=state_for,
                 pending_response=pending_response, messages=messages, resume_step=resume_step)
         finally:
+            self.save_partial_generation()
             self.live_generation = None
             write_json(workspace.meta / "last_task.json", {"job": job, "messages": messages})
             if job['status'] in {'failed', 'complete'}:
