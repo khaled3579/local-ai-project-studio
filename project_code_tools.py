@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import time
+from project_source_index import javascript_index
 
 ROOT=Path(__file__).resolve().parent
 NODE=ROOT/'runtime/node/node.exe'
@@ -39,20 +40,27 @@ def search(ws, query, mode='text', path='', limit=30):
                     if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)) and query.casefold() in node.name.casefold():candidates.append((node.lineno,node.name))
             except SyntaxError:pass
         elif mode=='definitions':
-            pattern=re.compile(r'\b(?:function|class|interface|type|const|let|var)\s+([\w$]+)')
-            for i,line in enumerate(lines):
-                for match in pattern.finditer(line):
-                    if query.casefold() in match[1].casefold():candidates.append((i+1,match[1]))
+            if Path(row['path']).suffix in {'.js','.jsx','.ts','.tsx','.mjs','.cjs'} and query.casefold() in text.casefold():
+                try:
+                    definitions, _ = javascript_index(text, Path(row['path']).suffix)
+                    candidates = [(d['start_line'], d['symbol']) for d in definitions if query.casefold() in d['symbol'].casefold()]
+                except (ValueError, OSError, subprocess.TimeoutExpired):
+                    pass
+            if not candidates:
+                pattern=re.compile(r'\b(?:function|class|interface|type|const|let|var)\s+([\w$]+)')
+                for i,line in enumerate(lines):
+                    for match in pattern.finditer(line):
+                        if query.casefold() in match[1].casefold():candidates.append((i+1,match[1]))
         else:
             pattern=re.compile((r'(?<![\w$])'+re.escape(query)+r'(?![\w$])') if mode=='references' else re.escape(query),re.I)
             candidates=[(i+1,query) for i,line in enumerate(lines) if pattern.search(line)]
         for line,name in candidates:
             total+=1
             if len(hits)>=5000:continue
-            hits.append({'path':row['path'],'line':line,'symbol':name,'kind':'AST definition' if mode=='definitions' and row['path'].endswith('.py') else 'lexical '+mode,
+            hits.append({'path':row['path'],'line':line,'symbol':name,'kind':'definition (AST when source syntax is supported)' if mode=='definitions' else 'lexical '+mode,
                 'context':[{'line':i+1,'text':lines[i][:400]} for i in range(max(0,line-2),min(len(lines),line+1))]})
     hits.sort(key=lambda h:(h['symbol'].casefold()!=query.casefold(),h['path'],h['line']))
-    return {'matches':hits[:limit],'total_matches':total,'scanned_files':scanned,'skipped_budget':skipped,'truncated':total>limit,'reference_accuracy':'Python definitions use AST; references are lexical matches, not full language-server symbol resolution'}
+    return {'matches':hits[:limit],'total_matches':total,'scanned_files':scanned,'skipped_budget':skipped,'truncated':total>limit,'reference_accuracy':'Python and valid JS/TS definitions use syntax ASTs, with lexical fallback for unsupported syntax; references are lexical, not language-server symbol resolution'}
 
 
 def diagnose(ws,path=''):

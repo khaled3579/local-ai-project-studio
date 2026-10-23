@@ -12,22 +12,58 @@ import subprocess
 import sys
 import time
 import uuid
+from typing import Callable, TypeVar, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from project_toolhub import ToolHub
+    from project_recovery import Recovery
+    from project_drafts import Drafts
 from project_history import History, locked, recorded_command
+from project_command_output import command_result
 from app_maintenance import ensure_schema
 from project_validation import VERSION as VALIDATION_VERSION, COMMAND_ENV, python_tests, node_tests, node_syntax, tkinter_startup
+from project_file_context import read_view
 
 EXCLUDED = {".local-ai", ".venv", "venv", ".git", "node_modules", "__pycache__", ".pytest_cache"}
 
-def atomic_replace(source, target):
+_SnapshotT = TypeVar('_SnapshotT')
+
+
+def _retry_missing_file(operation: Callable[[], _SnapshotT]) -> _SnapshotT:
+    """Restart a torn filesystem snapshot; never return partial/cached state."""
+    for attempt in range(3):
+        try:
+            return operation()
+        except FileNotFoundError:
+            if attempt == 2:
+                raise
+            time.sleep(.02 * (attempt + 1))
+    raise AssertionError('unreachable snapshot retry state')
+
+def atomic_replace(source, target, before_replace: Callable[[], object] | None = None):
     # Windows indexers/scanners can briefly hold a newly written file open.
     for attempt in range(6):
         try:
+            if before_replace is not None:
+                before_replace()
             source.replace(target)
             return
         except PermissionError:
             if attempt == 5:
                 raise
             time.sleep(0.02 * (attempt + 1))
+
+
+def _expected_file_bytes(path: Path, expected_sha256: str | None) -> bytes | None:
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        if expected_sha256 not in (None, ''):
+            raise ValueError('File disappeared or changed; read current state before creating it again.')
+        return None
+    if expected_sha256 != hashlib.sha256(raw).hexdigest():
+        raise ValueError('Read the current file first and pass its expected_sha256; the file may have changed.')
+    return raw
 
 def tool(name, description, properties=None, required=None):
     return {"type": "function", "function": {"name": name, "description": description,
@@ -36,7 +72,10 @@ def tool(name, description, properties=None, required=None):
 STRING = {"type": "string"}
 TOOLS = [
     tool("list_files", "List actual files in the selected project. Start by inspecting the project."),
-    tool("read_file", "Read a UTF-8 project file. Returns its SHA256, required before overwriting existing files.", {"path": STRING}, ["path"]),
+    tool("read_file", "Read current UTF-8 source with the complete-file SHA256. Prefer symbol (qualified Python/JavaScript/TypeScript function, class or method name), outline=true, or start_line/end_line. Default view is paginated at 12000 characters; follow next_read when more=true. Source excerpts are not the whole file: use patch_file for local edits; never overwrite a file with an excerpt.",
+         {"path": STRING, "start_line": {"type": "integer", "minimum": 1}, "end_line": {"type": "integer", "minimum": 1},
+          "symbol": STRING, "outline": {"type": "boolean"}, "offset": {"type": "integer", "minimum": 0},
+          "max_chars": {"type": "integer", "minimum": 1, "maximum": 32000}}, ["path"]),
     tool("write_file", "Create or update a complete file inside the selected project. Existing files require reading first, then expected_sha256='@last_read' (the controller supplies the exact observed hash and still rejects stale edits). Parent folders are created. Save code with this tool.", {"path": STRING, "content": STRING, "expected_sha256": STRING}, ["path", "content"]),
     tool('patch_file', "Repair an existing file with ONE exact text replacement instead of rewriting it. Read current file first, then use expected_sha256='@last_read'. old_text must occur exactly once. Python syntax is checked before committing; failed patches do not change the file. Prefer this for small fixes.", {'path':STRING,'old_text':STRING,'new_text':STRING,'expected_sha256':STRING}, ['path','old_text','new_text','expected_sha256']),
     tool("run_command", "Execute a noninteractive project command with its cwd set to the project. Python uses the project .venv. Use for diagnostics/tests, not persistent GUI apps. Use an argv array, not a shell expression.", {"argv": {"type": "array", "items": STRING}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 120}}, ["argv"]),
@@ -47,6 +86,15 @@ from project_toolhub import schemas as assistant_schemas, NAMES as ASSISTANT_NAM
 TOOLS.extend(assistant_schemas(tool, STRING))
 
 class Workspace:
+    # Lazily created stores are declared here without changing hasattr semantics.
+    assistant_tools: "ToolHub"
+    recovery_store: "Recovery"
+    composer_store: "Drafts"
+    source_guard_baseline: dict[str, str]
+    _acceptance_contract: dict[str, object] | None
+    performance_contract: dict[str, object] | None
+    quality_contract: dict[str, object] | None
+
     def __init__(self, root, on_event=None):
         self.root = Path(root).expanduser().resolve()
         if not self.root.is_dir() or self.root == Path(self.root.anchor):
@@ -57,6 +105,7 @@ class Workspace:
         self.meta.mkdir(exist_ok=True)
         ensure_schema(self.meta)
         self.event = on_event or (lambda *_: None)
+        self.process_observer: Callable[[int], object] | None = None
         self.running = None
         self.run_log = None
         self.hash_cache = {}
@@ -74,6 +123,9 @@ class Workspace:
         return candidate
 
     def files(self):
+        return _retry_missing_file(self._files_once)
+
+    def _files_once(self):
         result = []
         for base, dirs, files in os.walk(self.root, followlinks=False):
             dirs[:] = [d for d in dirs if d not in EXCLUDED and not (Path(base) / d).is_symlink() and (Path(base) / d).resolve().is_relative_to(self.root)]
@@ -85,6 +137,9 @@ class Workspace:
         return sorted(result, key=lambda v: v["path"])
 
     def fingerprint(self, force=False):
+        return _retry_missing_file(lambda: self._fingerprint_once(force))
+
+    def _fingerprint_once(self, force=False):
         values = []
         for item in self.files():
             p = self.root / item["path"]
@@ -100,24 +155,35 @@ class Workspace:
             values.append((item["path"], digest))
         return hashlib.sha256(json.dumps(values).encode()).hexdigest()
 
-    def read(self, path):
-        p = self.path(path)
-        if p.stat().st_size > 2 * 1024 * 1024:
-            raise ValueError("اقرأ الملفات النصية التي يقل حجمها عن 2MB على أجزاء أصغر.")
-        raw = p.read_bytes()
-        return {"path": p.relative_to(self.root).as_posix(), "content": raw.decode("utf-8-sig"), "sha256": hashlib.sha256(raw).hexdigest()}
+    def read(self, path, **view):
+        try:
+            return read_view(self, path, **view)
+        except FileNotFoundError as error:
+            import difflib
+            requested = self.path(path).relative_to(self.root).as_posix()
+            try:
+                candidates = difflib.get_close_matches(requested, [row['path'] for row in self.files()], n=5, cutoff=0.65)
+            except OSError:
+                candidates = []  # Optional hints must never mask the original IO error.
+            if not candidates:
+                raise
+            raise FileNotFoundError(error.errno, str(error.strerror) + '; similar existing file paths (suggestions only, not read or edit redirects): ' + json.dumps(candidates, ensure_ascii=False), error.filename) from None
+
+    def read_for_model(self, path, **view):
+        view.setdefault('max_chars', 12000)
+        return self.read(path, **view)
 
     @locked
     def write(self, path, content, expected_sha256=None):
         p = self.path(path)
         if not isinstance(content, str):
             raise ValueError("content must be text")
-        if p.exists():
-            old = p.read_bytes()
-            if expected_sha256 != hashlib.sha256(old).hexdigest():
-                raise ValueError("Read the current file first and pass its expected_sha256; the file may have changed.")
+        old = _expected_file_bytes(p, expected_sha256)
+        from project_source_guard import check_source
+        check_source(p, content, old)
         self.history.checkpoint("قبل تعديل: " + str(path))
-        if p.exists():
+        _expected_file_bytes(p, expected_sha256)
+        if old is not None:
             backup = self.meta / "backups" / (time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]) / p.relative_to(self.root)
             backup.parent.mkdir(parents=True, exist_ok=True)
             backup.write_bytes(old)
@@ -125,7 +191,15 @@ class Workspace:
         temporary = p.with_name(p.name + "." + uuid.uuid4().hex[:8] + ".tmp")
         content = content.replace("\r\n", "\n")
         temporary.write_text(content, encoding="utf-8", newline="\n")
-        atomic_replace(temporary, p)
+        try:
+            atomic_replace(temporary, p, before_replace=lambda: _expected_file_bytes(p, expected_sha256))
+        except BaseException:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                # Cleanup must never replace the actual concurrency/IO failure.
+                pass
+            raise
         self.history.checkpoint("حفظ: " + str(path))
         self.event("file_written", {"path": p.relative_to(self.root).as_posix()})
         return {"saved": p.relative_to(self.root).as_posix(), "bytes": p.stat().st_size, "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
@@ -166,11 +240,12 @@ class Workspace:
         env.update(COMMAND_ENV.get())
         started = time.monotonic()
         p = subprocess.Popen(argv, cwd=self.root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
-        if getattr(self, "process_observer", None):
-            self.process_observer(p.pid)
+        observer = self.process_observer
+        if observer is not None:
+            observer(p.pid)
         try:
             stdout, stderr = p.communicate(timeout=max(1, min(120, timeout_seconds)))
-            result = {"argv": original, "exit_code": p.returncode, "stdout": stdout if len(stdout) <= 24000 else stdout[:12000] + "\n[output excerpt]\n" + stdout[-12000:], "stderr": stderr if len(stderr) <= 24000 else stderr[:12000] + "\n[output excerpt]\n" + stderr[-12000:], "seconds": round(time.monotonic() - started, 2)}
+            result = command_result(self, original, p.returncode, stdout, stderr, round(time.monotonic() - started, 2))
         except subprocess.TimeoutExpired as error:
             import psutil
             try:
@@ -183,8 +258,8 @@ class Workspace:
             except psutil.NoSuchProcess:
                 pass
             p.kill()
-            p.communicate()
-            result = {"argv": original, "exit_code": None, "timed_out": True, "stdout": str(error.stdout or "")[-12000:], "stderr": str(error.stderr or "")[-12000:]}
+            stdout, stderr = p.communicate()
+            result = command_result(self, original, None, stdout, stderr, round(time.monotonic() - started, 2), timed_out=True)
         self.event("command", result)
         return result
 
@@ -193,6 +268,10 @@ class Workspace:
         checks = [node_syntax(self, files)]
         missing = []
         class Assets(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.refs: list[str] = []
+
             def handle_starttag(self, tag, attrs):
                 values = dict(attrs)
                 ref = values.get('src') if tag in {'script', 'img'} else values.get('href') if tag == 'link' and values.get('rel') == 'stylesheet' else None
@@ -201,7 +280,7 @@ class Workspace:
         for item in files:
             if not item['path'].endswith(('.html', '.htm')):
                 continue
-            html = self.path(item['path']); parser = Assets();parser.refs = []
+            html = self.path(item['path']); parser = Assets()
             parser.feed(html.read_text(encoding='utf-8-sig'))
             for ref in parser.refs:
                 url = urlsplit(ref)
@@ -273,11 +352,27 @@ class Workspace:
                 checks.append({"name": "npm_test", "passed": False, "error": "لا يوجد test script. أضف اختبارات حقيقية."})
         if not checks:
             checks.append({"name": "supported_validation", "passed": False, "error": "الفحص التلقائي يدعم Python وNode حاليًا. يمكن تشغيل أدوات لغات أخرى بالأمر المناسب، لكن يلزم تقرير فحص صريح."})
+        if getattr(self, 'source_guard_baseline', None) is not None:
+            from project_source_guard import definition_check
+            checks.append(definition_check(self))
+        quality = getattr(self, 'quality_contract', None)
+        if quality is not None:
+            from project_quality_contract import quality_check
+            checks.append(quality_check(self, quality) if all(c['passed'] for c in checks) else
+                          {'name':'quality_contract','passed':False,'error':'Functional validation must pass before generated-test quality can be accepted.'})
+        contract = getattr(self, 'performance_contract', None)
+        if contract is not None:
+            from project_performance import performance_check
+            checks.append(performance_check(self, contract) if all(c['passed'] for c in checks) else
+                          {'name':'performance_contract','passed':False,'error':'Functional validation must pass before performance can be accepted.'})
         final_fingerprint = self.fingerprint(force=True)
         report = {"validator_version": VALIDATION_VERSION,
                   "timestamp": time.time(), "success": bool(checks) and all(c["passed"] for c in checks),
                   "checks": checks, "fingerprint": final_fingerprint, "source_unchanged_during_validation": start_fingerprint == final_fingerprint,
                   "scope": "syntax/build, project tests and detected Tkinter entry startup; not a guarantee of all behavior or GUI rendering"}
+        report['performance_contract_sha256'] = (contract or {}).get('policy_sha256')
+        report['quality_contract_sha256'] = (quality or {}).get('policy_sha256')
+        report['source_guard_baseline_sha256'] = (getattr(self, 'source_guard_baseline', None) or {}).get('sha256')
         if not report["source_unchanged_during_validation"]:
             report["success"] = False
         self._save_validation_report(report)
@@ -299,8 +394,9 @@ class Workspace:
     @locked
     def run(self, entry, args=None, background=True):
         report = self.last_validation()
+        from project_source_guard import validation_current as source_current
         # UI polling may use the stat cache; execution must verify current bytes.
-        if not report or not report["success"] or not report["current"] or report['fingerprint'] != self.fingerprint(force=True):
+        if not report or not report["success"] or not report["current"] or not source_current(self, report) or report['fingerprint'] != self.fingerprint(force=True):
             raise ValueError("افحص المشروع وأصلح الأخطاء قبل تشغيله: validate_project")
         p = self.path(entry)
         self.history.checkpoint("قبل تشغيل التطبيق")
@@ -311,8 +407,9 @@ class Workspace:
                 raise ValueError('التطبيق يعمل بالفعل؛ افتح المعاينة الحالية أو أوقفه أولًا')
             self.run_log = (self.meta / 'application.log').open('wb')
             self.running = subprocess.Popen([sys.executable, str(Path(__file__).with_name('project_preview.py')), '--root', str(self.root), '--entry', p.relative_to(self.root).as_posix()], cwd=self.root, stdout=self.run_log, stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-            if getattr(self, 'process_observer', None):
-                self.process_observer(self.running.pid)
+            observer = self.process_observer
+            if observer is not None:
+                observer(self.running.pid)
             for _ in range(100):
                 log = (self.meta / 'application.log').read_text(encoding='utf-8', errors='replace')
                 match = re.search(r'PREVIEW_URL=(http://127\.0\.0\.1:\d+/[^\r\n]*)', log)
@@ -336,8 +433,9 @@ class Workspace:
         env = os.environ.copy()
         env["PYTHONUTF8"] = "1"
         self.running = subprocess.Popen(argv, cwd=self.root, env=env, stdout=self.run_log, stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
-        if getattr(self, "process_observer", None):
-            self.process_observer(self.running.pid)
+        observer = self.process_observer
+        if observer is not None:
+            observer(self.running.pid)
         # Popen success alone does not prove that the application started.
         for _ in range(10):
             time.sleep(.1)
@@ -373,16 +471,25 @@ class Workspace:
     def patch(self, path, old_text, new_text, expected_sha256):
         value=self.read(path)
         if value['sha256']!=expected_sha256:raise ValueError('File changed; read current file again')
-        if not isinstance(old_text,str) or not old_text or value['content'].count(old_text)!=1:
+        # Match model-authored LF snippets against Windows CRLF sources. Writes
+        # already normalize CRLF; the concurrency guard still hashes raw bytes.
+        source = value['content'].replace('\r\n', '\n')
+        if isinstance(old_text, str):old_text = old_text.replace('\r\n', '\n')
+        if isinstance(new_text, str):new_text = new_text.replace('\r\n', '\n')
+        if not isinstance(old_text,str) or not old_text or source.count(old_text)!=1:
             raise ValueError('old_text must match exactly once; read the current file and choose a unique block')
         if old_text==new_text:raise ValueError('Patch makes no change. Diagnose the failing behavior and provide a different replacement.')
-        content=value['content'].replace(old_text,new_text,1)
+        # An insertion may still contain its unique old block. Repeating it
+        # with a newer receipt must not nest/duplicate an already-present edit.
+        if isinstance(new_text,str) and old_text in new_text and new_text in source:
+            raise ValueError('Patch already present; do not repeat it. Read current source and use a precise current block for any additional change.')
+        content=source.replace(old_text,new_text,1)
         if str(path).endswith(('.py','.pyw')):ast.parse(content,filename=path)
         return self.write(path,content,expected_sha256)
 
     def invoke(self, name, arguments):
         if name in ASSISTANT_NAMES:return assistant_hub(self).invoke(name,arguments)
-        handlers = {"list_files": lambda: {"root": str(self.root), "files": self.files()}, "read_file": self.read,
+        handlers = {"list_files": lambda: {"root": str(self.root), "files": self.files()}, "read_file": self.read_for_model,
                     "write_file": self.write, "patch_file":self.patch, "run_command": self.command, "validate_project": self.validate, "run_project": self.run}
         if name not in handlers:
             raise ValueError("Unknown project tool")

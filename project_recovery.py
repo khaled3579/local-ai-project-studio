@@ -49,14 +49,20 @@ class Recovery:
             row = db.execute('SELECT * FROM checkpoints WHERE run_id=?', (run_id,)).fetchone()
         if not row:
             return None
+        return self._decode_checkpoint(row)
+
+    @staticmethod
+    def _decode_checkpoint(row):
         if hashlib.sha256(row['payload'].encode()).hexdigest() != row['digest']:
             raise ValueError('نقطة الاستعادة تالفة؛ لم تنفذ أي أوامر')
         return json.loads(row['payload'])
 
     def states(self):
         with self.connect() as db:
-            ids = [r[0] for r in db.execute('SELECT run_id FROM checkpoints ORDER BY updated DESC')]
-        return [self.load(id) for id in ids]
+            rows = list(db.execute('SELECT * FROM checkpoints ORDER BY updated DESC'))
+        # One SELECT reads a coherent snapshot; validate every payload exactly
+        # as load() does. No missing or damaged checkpoint is silently skipped.
+        return [self._decode_checkpoint(row) for row in rows]
 
     def get_call(self, run_id, job_id, call_id):
         with self.connect() as db:

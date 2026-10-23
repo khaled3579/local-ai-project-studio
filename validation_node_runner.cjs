@@ -13,9 +13,30 @@ function atomicReport(destination, report) {
 
 module.exports = async function* executionReporter(source) {
   const registered = new Map();
+  const successes = new Map();
+  const registeredNames = new Map();
+  const identities = new Map();
+  function identify(data) {
+    const file = path.relative(process.env.LOCAL_AI_VALIDATION_ROOT || process.cwd(), data.file || data.entryFile).split(path.sep).join('/');
+    const suite = data.classname || data.details?.classname || '';
+    const id = 'node:' + [file, suite, data.name].map(encodeURIComponent).join('::');
+    const alias = 'node:' + data.name;
+    identities.set(id, {file, suite, name: data.name, legacy: alias});
+    return [id, alias];
+  }
   // A bare file can be a passing implicit test in Node. Only count registered
   // test cases from per-file test-runner summaries, retaining the global status.
   for await (const event of source) {
+    if (['test:pass', 'test:fail'].includes(event.type) && event.data.entryFile && event.data.details?.type !== 'suite') {
+      for (const id of identify(event.data)) {
+        registeredNames.set(id, (registeredNames.get(id) || 0) + 1);
+      }
+    }
+    if (event.type === 'test:pass' && event.data.entryFile && event.data.details?.type !== 'suite' && !event.data.skip && !event.data.todo) {
+      for (const id of identify(event.data)) {
+        successes.set(id, (successes.get(id) || 0) + 1);
+      }
+    }
     if (event.type !== 'test:summary') continue;
     if (event.data.file) { registered.set(event.data.file, event.data.counts); continue; }
     const directory = process.env.LOCAL_AI_VALIDATION_DIRECTORY;
@@ -24,7 +45,7 @@ module.exports = async function* executionReporter(source) {
     const counts = Object.fromEntries(['tests', 'passed', 'failed', 'cancelled', 'skipped', 'todo']
       .map(key => [key, [...registered.values()].reduce((sum, item) => sum + item[key], 0)]));
     atomicReport(path.join(directory, 'node-' + process.pid + '.json'), {
-      runner: 'node:test', run_id: runId, tests: counts.tests, passed: counts.passed,
+      runner: 'node:test', identity_version: 2, test_identities: Object.fromEntries(identities), run_id: runId, registered_test_names: Object.fromEntries(registeredNames), successful_tests: [...successes].filter(([id, count]) => count === 1 && registeredNames.get(id) === 1).map(([id]) => id), tests: counts.tests, passed: counts.passed,
       failed: counts.failed, cancelled: counts.cancelled, skipped: counts.skipped,
       todo: counts.todo, executed: counts.tests - counts.skipped - counts.todo,
       success: event.data.success, process_counts: event.data.counts,

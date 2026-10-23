@@ -19,3 +19,12 @@ __pycache__/
 *.sha256
 .env
 .env.*
+
+# Local engineering evidence, backups and generated installation manifests
+engineering/
+APP-MANIFEST.json
+.pytest_cache/
+*.gguf
+*.safetensors
+*.pem
+*.key

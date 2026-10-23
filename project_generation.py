@@ -2,6 +2,7 @@
 import json
 import uuid
 import re
+from project_context import inspection_guidance
 
 
 def output_budget(prompt, state, available):
@@ -61,7 +62,9 @@ def action_schema(tools, repair=False, allow_final=True):
 
 
 def request_body(messages, tools, limit, *, protocol='native', attempt=0, repair=False, thought_token=None, allow_final=True, output_tokens=4096):
+    guidance = inspection_guidance(messages, tools)
     body = {'messages':messages, 'max_tokens':min(output_tokens, limit), 'stream':True,
+            'stream_options': {'include_usage': True},
             'temperature':0.2 if attempt == 0 else min(0.65, 0.3 + attempt * 0.1),
             'top_p':0.9, 'repeat_penalty':1.05, 'reasoning_effort':'none',
             'reasoning_budget_tokens':0, 'chat_template_kwargs':{'enable_thinking':False}}
@@ -81,6 +84,8 @@ def request_body(messages, tools, limit, *, protocol='native', attempt=0, repair
         if not allow_final:instruction+=' Validation is not yet passing: a final answer or a promise to act is not allowed. Execute the needed file creation, repair or diagnostic tool now.'
         # Keep the immutable prompt prefix cacheable when repair mode changes.
         body['messages'].append({'role':'user','content':instruction})
+    if guidance:
+        body['messages'] = [*body['messages'], {'role': 'user', 'content': guidance}]
     return body
 
 
@@ -135,7 +140,9 @@ def repair_phase(workspace, report, prompt):
 
 def repair_focus(workspace, report, prompt):
     missing=missing_requested_sources(workspace,prompt)
-    return ('Current project files: '+json.dumps([f['path'] for f in workspace.files()])+\
+    files = [f['path'] for f in workspace.files()] if not report.get('success') or missing else []
+    inventory = ('Current project files (sample): '+json.dumps(files[:24])+f'; total={len(files)}. Use list_files for a specific missing path.\n') if files else ''
+    return (inventory+\
             '\nMissing files explicitly named in the original request: '+json.dumps(sorted(set(missing)))+\
             '\nIf a required module is absent, CREATE it next with write_file. Do not keep rewriting a working component to fix a missing module.\n'+validation_feedback(report))
 
@@ -177,7 +184,7 @@ def decode_action(choice, tools):
     if not tool or not isinstance(args,dict):raise ActionFormatError('Unknown tool or invalid arguments')
     schema = tool['parameters']
     if set(args) - set(schema.get('properties',{})) or any(k not in args for k in schema.get('required',[])):
-        raise ActionFormatError(name+': required arguments='+json.dumps(schema.get('required',[]))+
+        raise ActionFormatError(str(name)+': required arguments='+json.dumps(schema.get('required',[]))+
             '; missing='+json.dumps([k for k in schema.get('required',[]) if k not in args])+
             '; unexpected='+json.dumps(sorted(set(args)-set(schema.get('properties',{})))))
     return {'finish_reason':'tool_calls','message':{'role':'assistant','content':action.get('message',''),'tool_calls':[

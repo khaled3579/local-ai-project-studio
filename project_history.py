@@ -83,6 +83,10 @@ class History:
         return raw
 
     def checkpoint(self, reason, report=None, force=False):
+        from project_core import _retry_missing_file
+        return _retry_missing_file(lambda: self._checkpoint_once(reason, report, force))
+
+    def _checkpoint_once(self, reason, report=None, force=False):
         with self.lock:
             start = self.ws.fingerprint()
             report = self.ws.last_validation() if report is None else report

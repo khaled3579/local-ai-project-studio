@@ -11,6 +11,7 @@ FIXED={'daily_ai.py','daily_models.html','model_library.py','model_folder_picker
        'app_runtime.py','app_package.py','app_updates.py','app_maintenance.py','requirements.txt','requirements.lock.txt','runtime-lock.json',
        'Launch-Daily.ps1','Launch-Projects.ps1','Prepare-Runtime.ps1','Update-App.ps1','Rollback-App.ps1','Doctor.ps1',
        'Daily-AI.cmd','Daily-Projects.cmd','PACKAGE_README_AR.txt'}
+FIXED.update({'Start.cmd', 'Stop.cmd', 'Start-All.ps1', 'Stop-All.ps1', 'README_START_AR.txt'})
 
 
 def build(root,destination,version='4.0.0'):

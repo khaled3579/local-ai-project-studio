@@ -36,6 +36,8 @@ def failure_evidence(name, result):
         return json.dumps(failures, ensure_ascii=False, sort_keys=True) or 'validation failed'
     if result.get('timed_out') or result.get('exit_code', 0) not in (None, 0):
         return str(result.get('stderr') or result.get('stdout') or 'command failed')
+    if name == 'acceptance_plan' and result.get('missing_evidence'):
+        return json.dumps(result['missing_evidence'], ensure_ascii=False, sort_keys=True)
     if name == 'generation_limit':
         return 'incomplete output; no partial commands executed'
     return ''
@@ -112,7 +114,23 @@ class LoopGuard:
             return None
         self.state['last_alert'] = self.state['total']
         level = len(self.state['changes']) % 3
-        if name == 'generation_limit':
+        inspection = name in {'read_file','search_project','list_files','lookup_docs','read_project_requirements','read_continuation'}
+        passing_command = name == 'run_command' and not error and result.get('exit_code') == 0 and not result.get('timed_out')
+        quality_only = (name == 'validate_project' and result.get('success') is False
+                        and any(c.get('name') == 'quality_contract' and c.get('passed') is False for c in result.get('checks', []))
+                        and all(c.get('passed') is True or c.get('name') == 'quality_contract'
+                                or (c.get('name') == 'performance_contract' and c.get('error') == 'Functional validation must pass before performance can be accepted.')
+                                for c in result.get('checks', [])))
+        preserve_context = inspection or passing_command or quality_only or name == 'acceptance_plan'
+        if inspection:
+            plan = 'Inspection checkpoint only: preserve the current implementation, tests and task progress. A missing or ambiguous source path is not evidence of a production defect. Use the actual file inventory, the similar-path suggestions or a focused search to resolve the exact existing path. If this is a NEW requested deliverable, create it only within the original authorization. Do not repeat an unchanged failed read or invent a repair to working code. Continue the remaining original requirements using the evidence already captured.'
+        elif passing_command:
+            plan = 'The repeated command already passed on unchanged source. Reuse its durable result and finish the remaining original requirements or acceptance mapping. No production failure was observed: do not replace a function, restart inspection, or rerun the same command merely to reconstruct progress. All mandatory final validation and freshness gates remain required.'
+        elif quality_only:
+            plan = 'Generated-test evidence repair only: functional checks passed, but the mandatory host quality contract did not. Preserve the passing implementation and original tests. Correct or complete the NEW test modules using the exact failed quality diagnostics and independent expected values, then validate. Do not replace production functions or drop a requirement to satisfy a defective or incomplete oracle. Quality and performance thresholds are unchanged.'
+        elif name == 'acceptance_plan':
+            plan = 'Acceptance-link repair only: preserve every criterion and requirement group. Use the current repair_proposal and plan_revision with acceptance_plan(repair=true). For a behavioral typo review a relevant actual assertion and pass its exact ID in repairs. Do not rewrite or revalidate passing source, repeat zero queries, or replace whole requirement groups. A query is not an executed test.'
+        elif name == 'generation_limit':
             plan = 'The previous output was truncated and was not executed. Use the increased output budget for ONE complete file. Preserve any user-required single-file deliverable: if needed create a complete runnable skeleton, then add sections using targeted patch_file calls to that SAME file. For modular projects only, split independent modules or tests. Never resend the same truncated bulk write unchanged.'
         elif level == 0:
             plan = 'Switch to hypothesis-driven isolation: identify the FIRST failing assertion or diagnostic from the evidence below. Run a minimal reproduction using run_command which prints actual intermediate VALUES AND TYPES at the failing condition. Compare those types with the lookup keys or expected types. Do not rewrite the whole file or merely reformat exceptions. Patch the proven root cause, run the targeted reproduction, then full validation.'
@@ -123,7 +141,7 @@ class LoopGuard:
         change = {'number': len(self.state['changes']) + 1, 'step': step + 1, 'time': time.time(),
                   'reason': reason, 'trigger_tool': name, 'diagnostic': excerpt(error),
                   'recent_attempts': [{k:r.get(k) for k in ('number', 'step', 'tool', 'target', 'outcome', 'error_excerpt', 'fingerprint')} for r in history[-6:]],
-                  'plan': plan, 'applied': False}
+                  'plan': plan, 'preserve_context':preserve_context, 'applied': False}
         self.state['changes'].append(change)
         return change
 

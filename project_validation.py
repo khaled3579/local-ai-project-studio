@@ -7,9 +7,27 @@ from pathlib import Path
 import uuid
 import ast
 
-VERSION = 3
+VERSION = 7
 COMMAND_ENV = ContextVar('project_validation_command_environment', default={})
 ROOT = Path(__file__).resolve().parent
+
+
+def current_passing_validation(workspace, not_before=None):
+    """Reuse executed evidence only for identical sources and this validator version."""
+    from project_performance import contract_current
+    from project_source_guard import validation_current as source_current
+    contract=getattr(workspace,'performance_contract',None)
+    quality=getattr(workspace,'quality_contract',None)
+    report = workspace.last_validation()
+    if (report and report.get('success') and report.get('validator_version') == VERSION
+            and (not_before is None or isinstance(report.get('timestamp'), (int, float)) and report['timestamp'] >= not_before)
+            and report.get('source_unchanged_during_validation') and not workspace.validation_pending
+            and report.get('performance_contract_sha256')==(contract or {}).get('policy_sha256') and contract_current(contract)
+            and report.get('quality_contract_sha256')==(quality or {}).get('policy_sha256') and contract_current(quality)
+            and source_current(workspace, report)
+            and not report.get('in_progress') and report.get('fingerprint') == workspace.fingerprint(force=True)):
+        return report
+    return None
 
 
 @contextmanager
@@ -67,6 +85,8 @@ def python_tests(workspace):
     try:
         value = receipt(path, run_id, 'unittest')
         counts = test_counts(value)
+        ids = value.get('successful_tests', [])
+        check['successful_tests'] = [t for t in ids if ids.count(t) == 1]
         check.update({k: v for k, v in counts.items() if k != 'passed'}, tests_passed=counts['passed'])
         check['passed'] = result['exit_code'] == 0 and confirmed(counts, value.get('success'))
         if not check['passed']:
@@ -127,7 +147,7 @@ def node_tests(workspace, argv, name):
     options += ' --test-reporter=tap --test-reporter=' + reporter
     options += ' --test-reporter-destination=stdout --test-reporter-destination=stdout'
     with command_environment({'NODE_OPTIONS': options.strip(), 'LOCAL_AI_VALIDATION_DIRECTORY': str(directory),
-                              'LOCAL_AI_VALIDATION_RUN_ID': run_id}):
+                              'LOCAL_AI_VALIDATION_RUN_ID': run_id, 'LOCAL_AI_VALIDATION_ROOT': str(workspace.root)}):
         result = workspace.command(argv, 120)
     check = {'name': name, **result, 'passed': False, 'tests': 0, 'executed': 0, 'tests_passed': 0,
              'validation_run_id': run_id, 'evidence': str(directory.relative_to(workspace.root))}
@@ -137,6 +157,21 @@ def node_tests(workspace, argv, name):
             raise ValueError('لم يصدر مشغّل node:test تقرير تنفيذ لهذا الأمر. نجاح npm وحده ليس اختبارًا. استخدم node --test واختبارات حقيقية؛ لا تتجاوز مراسل الفحص بخيار reporter آخر. المشغّلات الأخرى تحتاج محوّل تقارير مدعومًا.')
         values = [receipt(path, run_id, 'node:test') for path in paths]
         counts = [test_counts(value) for value in values]
+        ids = [t for value in values for t in value.get('successful_tests', [])]
+        registered_names = {}
+        for value in values:
+            for name, count in value.get('registered_test_names', {}).items():
+                registered_names[name] = registered_names.get(name, 0) + count
+        identities = {key: item for value in values for key, item in value.get('test_identities', {}).items()}
+        eligible = {t for t in ids if ids.count(t) == 1 and registered_names.get(t) == 1}
+        # Keep old unique leaf IDs. Ambiguous leaves use their scoped identity.
+        # Exact duplicates in the same file/suite remain ineligible.
+        check['successful_tests'] = [t for t in dict.fromkeys(ids) if t in eligible and
+                                    (t not in identities or identities[t]['legacy'] not in eligible)]
+        check['test_identities'] = {t: identities[t] for t in check['successful_tests'] if t in identities}
+        for scoped, item in identities.items():
+            if item['legacy'] in check['successful_tests']:
+                check['test_identities'][item['legacy']] = item
         totals = {key: sum(count[key] for count in counts) for key in counts[0]}
         check.update({k: v for k, v in totals.items() if k != 'passed'}, tests_passed=totals['passed'])
         check['passed'] = result['exit_code'] == 0 and confirmed(totals, all(v.get('success') is True for v in values))

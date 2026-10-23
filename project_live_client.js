@@ -10,6 +10,55 @@
   const liveBadge = document.createElement('span');
   liveBadge.className = 'badge'; liveBadge.id = 'liveConnection';
   $('shellContextMeter').insertAdjacentElement('afterend', liveBadge);
+  const usageBadge = document.createElement('span');
+  usageBadge.id = 'tokenUsage'; usageBadge.className = 'badge';
+  usageBadge.setAttribute('aria-live', 'polite');
+  liveBadge.insertAdjacentElement('afterend', usageBadge);
+  const acceptanceButton = document.createElement('button');
+  acceptanceButton.id = 'acceptanceEvidence';
+  acceptanceButton.textContent = 'أدلة القبول';
+  usageBadge.insertAdjacentElement('afterend', acceptanceButton);
+  let acceptanceEvidence;
+  acceptanceButton.onclick = () => {
+    if (!acceptanceEvidence) return;
+    const dialog = document.createElement('dialog');
+    dialog.style.cssText = 'max-width:760px;width:90vw;max-height:85vh;overflow:auto;direction:rtl';
+    const title = document.createElement('h2'); title.textContent = 'ربط المتطلبات باختبارات القبول'; title.tabIndex = -1;
+    title.style.margin = '0';
+    const close = document.createElement('button'); close.textContent = 'إغلاق'; close.onclick = () => dialog.close();
+    close.style.flexShrink = '0';
+    const header = document.createElement('div');
+    header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:12px;position:sticky;top:0;background:inherit;z-index:1;padding:8px 0';
+    header.append(title, close);
+    const note = document.createElement('p');
+    note.textContent = acceptanceEvidence.validated
+      ? 'اجتازت المتطلبات المربوطة الاختبارات وقت إعداد التقرير. تبقى ملاءمة الاختبارات وشمولها مسؤولية المراجعة.'
+      : 'التسليم غير معتمد بعد؛ توجد أدلة أو روابط ناقصة، أو تحتاج الملفات إلى فحص حديث.';
+    dialog.append(header, note);
+    for (const row of acceptanceEvidence.requirements_coverage.items || []) {
+      const section = document.createElement('section');
+      const heading = document.createElement('h3'); heading.textContent = row.id + (row.requirement_ids?.length ? ' · ' + row.requirement_ids.join(', ') : '') + ' · ' + (row.passed ? 'دليل قبول مثبت' : 'دليل ناقص');
+      const quote = document.createElement('p'); quote.textContent = row.quote; quote.dir = 'auto';
+      const criterion = document.createElement('p'); criterion.textContent = row.criterion; criterion.dir = 'auto';
+      const tests = document.createElement('pre'); tests.style.cssText = 'white-space:pre-wrap;overflow-wrap:anywhere;direction:ltr';
+      tests.textContent = row.tests.join('\n');
+      section.append(heading, quote, criterion, tests); dialog.append(section);
+    }
+    dialog.onclose = () => dialog.remove(); document.body.append(dialog); dialog.showModal(); title.focus({preventScroll:true}); dialog.scrollTop = 0;
+  };
+
+  function paintUsage(job) {
+    const usage = job?.token_usage;
+    usageBadge.hidden = !usage;
+    if (!usage) { usageBadge.textContent = ''; return; }
+    const fmt = value => Number(value || 0).toLocaleString('en-US');
+    usageBadge.textContent = usage.measured_requests
+      ? 'توكن المهمة · إدخال ' + fmt(usage.prompt_tokens) + ' · إخراج ' + fmt(usage.completion_tokens)
+      : 'توكن المهمة · القياس غير متاح من المحرك';
+    usageBadge.title = 'طلبات مقاسة ' + fmt(usage.measured_requests) + ' / ' + fmt(usage.requests)
+      + ' · ردود غير مكتملة ' + fmt(usage.incomplete_requests)
+      + ' · المجاميع تشمل الطلبات التي أرسل المحرك أرقامها فقط، بما فيها المحاولات المعادة. لا تمثل حجم السياق الحالي.';
+  }
 
   function paint(packet) {
     if (!state) return;
@@ -17,6 +66,13 @@
     $('saveRequirements').disabled = state.job?.status === 'running' || state.repair_run?.status === 'running' || (memoryScope && (memoryScope.project !== state.project || memoryScope.session_id !== state.session_id));
     liveBadge.textContent = connected ? 'بث مباشر' : 'تحديث دوري · إعادة اتصال البث';
     const same = packet && packet.project === state.project && packet.session_id === state.session_id;
+    paintUsage(same && packet.job?.id === state.job?.id ? packet.job : state.job);
+    const job = same && packet.job?.id === state.job?.id ? packet.job : state.job;
+    acceptanceEvidence = typeof job?.delivery_evidence?.requirements_coverage === 'object' ? job.delivery_evidence : null;
+    acceptanceButton.disabled = !acceptanceEvidence;
+    acceptanceButton.textContent = acceptanceEvidence
+      ? 'أدلة القبول · ' + acceptanceEvidence.requirements_coverage.items.filter(row => row.passed).length + '/' + acceptanceEvidence.requirements_coverage.items.length
+      : 'أدلة القبول';
     const old = $('liveGeneration');
     if (!same || !packet.generation || packet.job?.status !== 'running') {
       old?.remove(); return;

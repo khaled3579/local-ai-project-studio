@@ -4,6 +4,7 @@ import queue
 import socket
 import threading
 import time
+from project_metrics import stream_measurement
 
 
 class GenerationInterrupted(Exception):
@@ -35,7 +36,7 @@ def abort_response(response):
     response.close()
 
 
-def consume(response, interrupted, update, *, progress_timeout=45, total_timeout=240):
+def consume(response, interrupted, update, *, progress_timeout=45, total_timeout=240, measure=None):
     inbox = queue.Queue(maxsize=64)
     stopped = threading.Event()
 
@@ -60,7 +61,8 @@ def consume(response, interrupted, update, *, progress_timeout=45, total_timeout
 
     threading.Thread(target=reader, daemon=True).start()
     text, calls, finish, size = '', {}, None, 0
-    started = time.monotonic()
+    started = getattr(response, 'inference_started', time.monotonic())
+    usage, timings, first_token, outcome = {}, {}, None, 'incomplete'
     last_progress = started
     initial_timeout = getattr(response, 'initial_progress_timeout', progress_timeout)
     total_timeout = getattr(response, 'generation_total_timeout', total_timeout)
@@ -103,10 +105,15 @@ def consume(response, interrupted, update, *, progress_timeout=45, total_timeout
                             if not isinstance(json.loads(call['function']['arguments']), dict):
                                 raise ValueError('معاملات الأداة ليست كائنًا صالحًا')
                     message['tool_calls'] = ordered
+                outcome = 'length' if finish == 'length' else 'complete'
                 return {'message':message, 'finish_reason':finish}
             event = json.loads(data)
             if event.get('error'):
                 raise RuntimeError(str(event['error']))
+            if isinstance(event.get('usage'), dict):
+                usage.update(event['usage'])
+            if isinstance(event.get('timings'), dict):
+                timings.update(event['timings'])
             choices = event.get('choices') or []
             if not choices:
                 continue
@@ -130,6 +137,8 @@ def consume(response, interrupted, update, *, progress_timeout=45, total_timeout
                     size += len(part)
             if size > previous_size:
                 last_progress = time.monotonic()
+                if first_token is None:
+                    first_token = round(last_progress - started, 6)
             if size-last_scan>=128:
                 last_scan=size
                 if repeated_suffix(progress_tail):
@@ -142,3 +151,9 @@ def consume(response, interrupted, update, *, progress_timeout=45, total_timeout
     finally:
         stopped.set()
         threading.Thread(target=abort_response, args=(response,), daemon=True).start()
+        if measure is not None:
+            # Observer errors cannot alter execution semantics of assembled tools.
+            try:
+                measure(stream_measurement(usage, timings, started, first_token, outcome))
+            except Exception:
+                pass
