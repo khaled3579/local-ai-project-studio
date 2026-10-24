@@ -1,0 +1,36 @@
+{
+  "version": "4.10.3",
+  "new_tests_run_for_publication": 0,
+  "new_model_generations_for_publication": 0,
+  "evidence_scope": "Historical static receipts and current selected source hashes only; no tests rerun.",
+  "historical_receipts": {
+    "4.10.0": {
+      "filesAnalyzed": 6,
+      "errorCount": 0,
+      "warningCount": 0
+    },
+    "4.10.1": {
+      "filesAnalyzed": 3,
+      "errorCount": 0,
+      "warningCount": 0
+    },
+    "4.10.2": {
+      "filesAnalyzed": 3,
+      "errorCount": 0,
+      "warningCount": 0
+    },
+    "4.10.3": {
+      "filesAnalyzed": 1,
+      "errorCount": 0,
+      "warningCount": 0
+    }
+  },
+  "binary_runtime_uploaded": false,
+  "user_state_uploaded": false,
+  "native_patch_upstream_commit": "27c54b4bbcefadedcec6397477cc2e866c1db716",
+  "limitations": [
+    "No fresh functional or model-generation proof.",
+    "No new token/performance claims.",
+    "Native DLL fix requires matching runtime; source archives do not contain it."
+  ]
+}

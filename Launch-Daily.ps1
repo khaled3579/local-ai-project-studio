@@ -20,15 +20,29 @@ foreach($service in @(@{Name='studio';Script='project_studio.py';Port=18078;Pid=
     $scriptPath=Join-Path $PSScriptRoot $service.Script
     $bootstrapId=[Guid]::NewGuid().ToString('N')
     $bootstrapOut=Join-Path $serviceLog ('logs/'+$service.Name+'-bootstrap-'+$bootstrapId+'.stdout.log')
-    $bootstrapErr=Join-Path $serviceLog ('logs/'+$service.Name+'-bootstrap-'+$bootstrapId+'.stderr.log')
     New-Item -ItemType Directory -Path (Join-Path $serviceLog 'logs') -Force | Out-Null
-    $process=Start-Process -FilePath $runtimePython -ArgumentList @('-E','-s','-u',('"'+$scriptPath+'"')) -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -PassThru -RedirectStandardOutput $bootstrapOut -RedirectStandardError $bootstrapErr
+    # WMI owns the launch, so closing a launcher/installer job cannot own this service tree.
+    # The bootstrap preserves startup errors and native crash traces in a real file.
+    $startup=New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ShowWindow=[uint16]0}
+    $bootstrap=Join-Path $PSScriptRoot 'service_bootstrap.py'
+    $command='"'+$runtimePython+'" -E -s -u "'+$bootstrap+'" "'+$scriptPath+'" "'+$bootstrapOut+'"'
+    $created=Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=$command;CurrentDirectory=$PSScriptRoot;ProcessStartupInformation=$startup}
+    if($created.ReturnValue -ne 0){throw "Independent service launch failed: $($created.ReturnValue). Existing services were preserved."}
+    $process=Get-Process -Id $created.ProcessId -ErrorAction Stop
     [IO.File]::WriteAllText((Join-Path $serviceLog $service.Pid),[string]$process.Id)
     $ready=$false
     for($attempt=0;$attempt -lt 60;$attempt++) {
         Start-Sleep -Milliseconds 250
         if($process.HasExited){throw "Service $($service.Name) exited; inspect daily\logs."}
-        try {$r=Invoke-RestMethod "http://127.0.0.1:$($service.Port)/api/state" -TimeoutSec 1;$ready=$true;break}catch{}
+        try {
+            $r=Invoke-RestMethod "http://127.0.0.1:$($service.Port)/api/state" -TimeoutSec 1
+            $listeners=@(Get-NetTCPConnection -State Listen -LocalPort $service.Port -ErrorAction Stop | Select-Object -ExpandProperty OwningProcess -Unique)
+            if($listeners.Count -ne 1){throw 'Unexpected listener count'}
+            $actual=Get-CimInstance Win32_Process -Filter "ProcessId = $($listeners[0])"
+            if(-not $actual -or -not $actual.CommandLine.Contains($scriptPath)){throw 'Unexpected service owner'}
+            [IO.File]::WriteAllText((Join-Path $serviceLog $service.Pid),[string]$listeners[0])
+            $ready=$true;break
+        }catch{}
     }
     if(-not $ready){throw "Service $($service.Name) did not become ready."}
 }

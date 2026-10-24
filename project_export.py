@@ -11,8 +11,7 @@ EXCLUDE_DIRS = {'.local-ai', '.venv', 'venv', 'env', '.git', 'node_modules',
                 '__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache',
                 '.tox', '.nox', '.cache', 'logs', 'tmp', 'temp', '__macosx'}
 EXCLUDE_SUFFIXES = {'.pyc', '.pyo', '.log', '.tmp', '.temp', '.swp', '.swo', '.bak'}
-MAX_BYTES = 200 * 1024 * 1024
-MAX_FILES = 5000
+CHUNK_BYTES = 1024 * 1024
 
 
 def excluded(path):
@@ -64,7 +63,7 @@ def instructions(files, entry, report, docs_dir):
     return '\n'.join(lines) + '\n'
 
 
-def build_export(workspace, entry=''):
+def build_export(workspace, entry='', output=None):
     report = workspace.last_validation()
     if not report or not report.get('success') or not report.get('current'):
         raise ValueError('افحص المشروع وأصلح أخطاءه قبل التصدير؛ يلزم تقرير ناجح يطابق الملفات الحالية')
@@ -77,8 +76,6 @@ def build_export(workspace, entry=''):
     selected = [f for f in candidates if not excluded(f['path'])]
     if not selected:
         raise ValueError('لا توجد ملفات مشروع قابلة للتصدير')
-    if len(selected) > MAX_FILES or sum(f['bytes'] for f in selected) > MAX_BYTES:
-        raise ValueError('التصدير يدعم حتى 5000 ملف و200MB قبل الضغط')
     roots = {PurePosixPath(f['path']).parts[0].casefold() for f in candidates}
     docs = 'PROJECT_DELIVERY'
     index = 1
@@ -92,26 +89,25 @@ def build_export(workspace, entry=''):
                 'excluded_suffix_rules': sorted(EXCLUDE_SUFFIXES),
                 'environment_files': '.env and .env.* except example/sample/template',
                 'validation_scope': report.get('scope'), 'documentation_directory': docs}
-    buffer = io.BytesIO()
-    total = 0
+    buffer = io.BytesIO() if output is None else output
     with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as archive:
         for item in selected:
             path = workspace.path(item['path'])
             if path.is_symlink():
                 raise ValueError('تغير مسار أحد الملفات أثناء التصدير؛ أعد الفحص')
-            with path.open('rb') as source:
-                raw = source.read(MAX_BYTES - total + 1)
-            total += len(raw)
-            if total > MAX_BYTES:
-                raise ValueError('تجاوز حجم التصدير 200MB أثناء القراءة')
-            if hashlib.sha256(raw).hexdigest() != expected.get(item['path']):
+            digest, size = hashlib.sha256(), 0
+            with path.open('rb') as source, archive.open(item['path'], 'w', force_zip64=True) as sink:
+                while chunk := source.read(CHUNK_BYTES):
+                    sink.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+            if digest.hexdigest() != expected.get(item['path']):
                 raise ValueError('تغير محتوى ملف أثناء التصدير؛ لم يُعتمد ZIP، أعد الفحص')
-            archive.writestr(item['path'], raw)
-            manifest['files'].append({'path': item['path'], 'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()})
+            manifest['files'].append({'path': item['path'], 'bytes': size, 'sha256': digest.hexdigest()})
         end = workspace.fingerprint(force=True)
         if end != start:
             raise ValueError('تغيرت ملفات المشروع أثناء التصدير؛ أعد فحصه ثم صدّره مجددًا')
         archive.writestr(docs + '/VALIDATION_REPORT.json', json.dumps(report, ensure_ascii=False, indent=2))
         archive.writestr(docs + '/RUN_INSTRUCTIONS_AR.txt', instructions(selected, entry, report, docs))
         archive.writestr(docs + '/MANIFEST.json', json.dumps(manifest, ensure_ascii=False, indent=2))
-    return buffer.getvalue(), manifest
+    return (buffer.getvalue() if output is None else None), manifest

@@ -64,10 +64,7 @@ def action_schema(tools, repair=False, allow_final=True):
 def request_body(messages, tools, limit, *, protocol='native', attempt=0, repair=False, thought_token=None, allow_final=True, output_tokens=4096):
     guidance = inspection_guidance(messages, tools)
     body = {'messages':messages, 'max_tokens':min(output_tokens, limit), 'stream':True,
-            'stream_options': {'include_usage': True},
-            'temperature':0.2 if attempt == 0 else min(0.65, 0.3 + attempt * 0.1),
-            'top_p':0.9, 'repeat_penalty':1.05, 'reasoning_effort':'none',
-            'reasoning_budget_tokens':0, 'chat_template_kwargs':{'enable_thinking':False}}
+            'stream_options': {'include_usage': True}}
     if type(thought_token) is int:
         # Gemma can reopen a thought channel after the runtime closes its budget.
         # The template may prefill ONE bounded thought; prohibit reopening it.

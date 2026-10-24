@@ -1,5 +1,6 @@
 """Local control panel for the measured dual-3090 configuration."""
 import hmac
+from io import BufferedReader
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ from urllib.request import urlopen
 from model_library import ModelLibrary, inspect_gguf, atomic_json
 from app_maintenance import RotatingLog, console_logging
 from project_model_info import details as model_details, DecodeTiming, parse_gpus, expert_override
+from model_parameters import normalize, effective, arguments, SCHEMA, defaults as parameter_defaults
 
 
 ROOT = Path(__file__).resolve().parent
@@ -22,6 +24,7 @@ DATA = ROOT / "daily"
 DATA.mkdir(exist_ok=True)
 (DATA / "logs").mkdir(exist_ok=True)
 SETTINGS = DATA / "settings.json"
+PROFILES = DATA / 'model-profiles.json'
 TOKEN = secrets.token_hex(24)
 CONTROL_PORT = 18079
 MODEL_PORT = 18080
@@ -57,6 +60,7 @@ def validate(value, stored=False):
     if value.get('experts_used') is not None:
         expert_override(model,value['experts_used'])
         result['experts_used']=value['experts_used']
+    result['parameters'] = normalize(value.get('parameters'))
     return result
 
 def get_json(path, timeout=2):
@@ -93,14 +97,57 @@ class ModelManager:
         self.generating = False
         self.model_details = {}
         self.decode_timing = DecodeTiming()
+        self.parameter_settings = None
+        self.profiles = {}
+        self.profile_error = None
+        if PROFILES.exists():
+            try:
+                saved_profiles = json.loads(PROFILES.read_text(encoding='utf-8'))
+                if saved_profiles.get('version') != 1 or not isinstance(saved_profiles.get('models'), dict):
+                    raise ValueError('ملف إعدادات النماذج غير صالح؛ لم يُستبدل')
+                self.profiles = saved_profiles['models']
+            except (OSError, ValueError, AttributeError) as error:
+                self.profile_error = str(error)
         try:
             self.saved = validate(json.loads(SETTINGS.read_text(encoding="utf-8")), stored=True)
         except (OSError, ValueError):
             self.saved = DEFAULT.copy()
         threading.Thread(target=self.sample, daemon=True).start()
 
+    def reconcile_exit(self):
+        """Caller holds self.lock; loading/stopping belong to change()."""
+        if self.status != "ready" or self.process is None:
+            return
+        code = self.process.poll()
+        if code is None:
+            return
+        self.status = "failed"
+        self.error = f"توقف خادم النموذج (رمز الخروج: {code}). يمكنك تشغيله مجددًا من اللوحة. راجع سجل التشغيل."
+        self.active = None
+        self.generating = False
+        self.props = {}
+        self.model_details = {}
+        self.decode_timing = DecodeTiming()
+
     def sample(self):
         while True:
+            # Lifecycle detection must also work when NVIDIA telemetry fails.
+            with self.lock:
+                self.reconcile_exit()
+                process = self.process if self.status == "ready" else None
+            if process is not None:
+                try:
+                    generating = any(slot.get("is_processing") for slot in get_json("/slots", 2))
+                    with self.lock:
+                        self.reconcile_exit()
+                        # A late response from the previous server cannot update a new one.
+                        if self.status == "ready" and self.process is process:
+                            self.generating = generating
+                except (OSError, URLError, ValueError):
+                    with self.lock:
+                        self.reconcile_exit()
+                    # A live server's busy state is not cleared on a network error.
+                    # begin() independently verifies /slots before any model change.
             try:
                 p = subprocess.run(["nvidia-smi", "--query-gpu=index,name,memory.used,memory.total,temperature.gpu,utilization.gpu", "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=6, creationflags=subprocess.CREATE_NO_WINDOW)
                 if p.returncode:raise ValueError('تعذرت قراءة بطاقات NVIDIA')
@@ -109,32 +156,23 @@ class ModelManager:
                 with self.lock:
                     self.gpus = values
                     self.gpu_updated,self.gpu_error=time.time(),None
-                    if self.status == "ready" and self.process and self.process.poll() is not None:
-                        self.status = "failed"
-                        self.error = "توقف خادم النموذج. يمكنك تشغيله مجددًا من اللوحة."
-                        self.active = None
-                if self.status == "ready":
-                    try:
-                        generating = any(slot.get("is_processing") for slot in get_json("/slots", 2))
-                        with self.lock:
-                            self.generating = generating
-                    except (OSError, URLError, ValueError):
-                        pass
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 with self.lock:self.gpu_error=str(error)
             time.sleep(3)
 
     def snapshot(self):
         with self.lock:
+            self.reconcile_exit()
             return {"app": "daily3090", "status": self.status, "active": self.active, "target": self.target,
                     "saved": self.saved, "error": self.error, "generation": self.generation,
+                    "parameters": self.parameter_settings if self.active else None, "profile_error": self.profile_error,
                     "pid": self.process.pid if self.process and self.process.poll() is None else None,
                     "elapsed_seconds": round(time.monotonic() - self.started, 1) if self.started else None,
                     "log": str(self.log_path) if self.log_path else None, "log_error":self.log_error, "gpus": self.gpus,
                     "gpu_updated":self.gpu_updated,"gpu_stale":not self.gpu_updated or time.time()-self.gpu_updated>10,"gpu_error":self.gpu_error,
                     "actual_context": self.props.get("default_generation_settings", {}).get("n_ctx"),
                     "vision": self.props.get("modalities", {}).get("vision", False),
-                    "generating": self.generating,
+                    "generating": bool(self.status == "ready" and self.process and self.process.poll() is None and self.generating),
                     "model_info": ({**self.model_details, 'mtp_enabled':self.active.get('mtp'),
                         'experts_active':self.decode_timing.experts_used if self.decode_timing.experts_used is not None else self.model_details.get('experts_active'),
                         'experts_override':self.active.get('experts_used'),
@@ -143,6 +181,8 @@ class ModelManager:
                     "chat_url": f"http://127.0.0.1:{MODEL_PORT}"}
 
     def begin(self, config=None):
+        if config is not None and self.profile_error:
+            raise ValueError(self.profile_error)
         try:
             with urlopen('http://127.0.0.1:18078/api/state', timeout=2) as response:
                 studio = json.load(response)
@@ -202,11 +242,12 @@ class ModelManager:
         with self.lock:
             self.model_details=model_details(info,config['model'])
             self.decode_timing=DecodeTiming()
-        command = [str(executable), "-m", config['model'], "-ngl", "99", "-sm", "layer", "-ts", "1,1",
-                   "-c", str(config["context"]), "-b", "512", "-ub", "512", "-fa", "on",
-                   "-ctk", "q8_0", "-ctv", "q8_0", "-t", "8", "-tb", "16", "--fit", "off", "-np", "1",
+        self.parameter_settings = effective(dict(info, path=config['model']), config)
+        command = [str(executable), "-m", config['model'],
+                   "-c", str(config["context"]), "--fit", "off", "-np", "1",
                    "--no-context-shift", "--host", "127.0.0.1", "--port", str(MODEL_PORT),
-                   "--temp", "0", "--cors-origins", "localhost", "-lv", "4"]
+                   "--cors-origins", "localhost", "-lv", "4"]
+        command += arguments(self.parameter_settings)
         command += ["--spec-type", "draft-mtp", "--spec-draft-n-max", "3"] if config["mtp"] else ["--spec-type", "none"]
         command += expert_override(info,config.get('experts_used'))
         if config.get('projector'):
@@ -220,6 +261,8 @@ class ModelManager:
             env["PATH"] = str(Path(cuda_path) / "bin") + os.pathsep + env.get("PATH", "")
         self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, creationflags=subprocess.CREATE_NO_WINDOW)
         pipe=self.process.stdout;sink=self.log_file
+        if not isinstance(pipe, BufferedReader):
+            raise RuntimeError('تعذّر فتح قناة سجل المحرك الثنائية')
         def capture_log():
             try:
                 while True:
@@ -261,13 +304,20 @@ class ModelManager:
                     self.started = None
                 return
             self.launch(config)
-            atomic_json(SETTINGS, config)
+            profiles = {**self.profiles, config['model']: config.copy()}
+            atomic_json(PROFILES, {'version': 1, 'models': profiles})
+            try:
+                atomic_json(SETTINGS, config)
+            except OSError:
+                atomic_json(PROFILES, {'version': 1, 'models': self.profiles})
+                raise
             with LIBRARY.lock:
                 for model in LIBRARY.models:
                     if model['path'] == config['model']:
                         model['load_status'] = 'تم تحميله بنجاح'
             with self.lock:
                 self.saved = config.copy()
+                self.profiles = profiles
                 self.status = "ready"
                 self.generation += 1
         except Exception as error:
@@ -312,7 +362,7 @@ def pick_models():
     threading.Thread(target=work, daemon=True).start()
 
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *_):
+    def log_message(self, format: str, *args: object) -> None:
         pass
 
     def send(self, value, status=200):
@@ -331,7 +381,21 @@ class Handler(BaseHTTPRequestHandler):
             state['library'] = {k:v for k,v in library.items() if k not in ('models', 'errors')}
             self.send(state)
         elif self.path == '/api/library':
-            self.send(LIBRARY.snapshot())
+            library = LIBRARY.snapshot()
+            with MANAGER.lock:
+                profiles = dict(MANAGER.profiles)
+            library['models'] = [dict(model, parameter_defaults=parameter_defaults(model), saved_profile=profiles.get(model['path'])) for model in library['models']]
+            self.send(library)
+        elif self.path == '/api/parameter-schema':
+            self.send(SCHEMA)
+        elif self.path == '/model-parameters.js':
+            body = (ROOT / 'model_parameters_client.js').read_bytes()
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/javascript; charset=utf-8')
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            try:self.wfile.write(body)
+            except (BrokenPipeError, ConnectionError):pass
         elif self.path == '/api/client-session':
             if (self.headers.get('X-Local-Session') != 'refresh'
                     or self.headers.get('Host') not in (f'127.0.0.1:{CONTROL_PORT}', f'localhost:{CONTROL_PORT}')
@@ -361,7 +425,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             size = int(self.headers.get("Content-Length", "0"))
-            if size > 4096 or size < 0:
+            if size > 1024 * 1024 or size < 0:
                 raise ValueError("Invalid request size")
             payload = json.loads(self.rfile.read(size) or b"{}")
             if not isinstance(payload, dict):

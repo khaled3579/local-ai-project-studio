@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import base64
 import json
+from itertools import count
 import os
 from pathlib import Path
 import secrets
@@ -17,6 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit, parse_qs, quote
 
 import requests
+from model_parameters import apply_request
 from project_core import Workspace, TOOLS, atomic_replace, tool, STRING
 from project_attachments import Attachments, MAX_TOTAL, MAX_COUNT, attachment_limit
 from project_zip import inspect_zip, extract_zip
@@ -328,18 +330,22 @@ class Studio:
                 raise ValueError("اختر مشروعًا وانتظر انتهاء المهمة قبل التصدير")
             if value.get("project") != str(self.workspace.root) or value.get("session_id") != self.session_id:
                 raise ValueError("تغير المشروع أو المحادثة؛ أعد التصدير")
-            raw, manifest = build_export(self.workspace, str(value.get("entry") or ""))
             export_id = uuid.uuid4().hex
             directory = self.workspace.meta / "exports"
             directory.mkdir(exist_ok=True)
             if not directory.resolve().is_relative_to(self.workspace.meta.resolve()):
                 raise ValueError("مجلد التصدير خارج بيانات المشروع")
             temporary = directory / (export_id + ".tmp")
-            temporary.write_bytes(raw)
-            atomic_replace(temporary, directory / (export_id + ".zip"))
+            try:
+                with temporary.open('xb') as output:
+                    _, manifest = build_export(self.workspace, str(value.get("entry") or ""), output=output)
+                size = temporary.stat().st_size
+                atomic_replace(temporary, directory / (export_id + ".zip"))
+            finally:
+                temporary.unlink(missing_ok=True)
             result = {"id": export_id, "session_id": self.session_id,
                       "name": self.workspace.root.name + "_repaired_" + time.strftime("%Y%m%d-%H%M%S") + ".zip",
-                      "bytes": len(raw), "files": len(manifest["files"]),
+                      "bytes": size, "files": len(manifest["files"]),
                       "documentation_directory": manifest["documentation_directory"],
                       "source_fingerprint": manifest["source_fingerprint"]}
             write_json(directory / (export_id + ".json"), result)
@@ -347,6 +353,10 @@ class Studio:
             return result
 
     def export_download(self, export_id, session_id):
+        metadata, archive = self.export_download_file(export_id, session_id)
+        return metadata, archive.read_bytes()
+
+    def export_download_file(self, export_id, session_id):
         with self.lock:
             if not self.workspace or session_id != self.session_id or len(export_id) != 32 or any(c not in "0123456789abcdef" for c in export_id):
                 raise ValueError("رابط التنزيل لا يخص المشروع والمحادثة الحاليين؛ أعد التصدير")
@@ -359,7 +369,7 @@ class Studio:
             archive = directory / (export_id + ".zip")
             if archive.is_symlink():
                 raise ValueError("مسار الأرشيف غير صالح")
-            return metadata, archive.read_bytes()
+            return metadata, archive
 
     def repair_settings(self):
         workspace = self.require_workspace()
@@ -890,7 +900,15 @@ class Studio:
                 existing.update(kind='final', verified=verified, transcript_only=False)
             self.save_chat()
 
+    def save_reasoning_generation(self):
+        generation = self.live_generation
+        if generation and generation.get('reasoning'):
+            identity = generation['id'] + ':attempt:' + str(generation.get('reasoning_attempt', 0))
+            prefix = '[مقتطف من نهاية التفكير؛ العرض مختصر]\n' if generation.get('reasoning_truncated') else ''
+            self.save_assistant_message({'content': prefix + generation['reasoning']}, kind='reasoning', generation_id=identity)
+
     def save_partial_generation(self):
+        self.save_reasoning_generation()
         generation = self.live_generation
         if generation and generation.get('text'):
             self.save_assistant_message({'content': generation['text']}, kind='partial',
@@ -1011,7 +1029,7 @@ class Studio:
             number = old_session.get('continuation_number', 0) + 1
             session = {"id": new_id, "parent_id": old_id, "continuation_number": number,
                        "title": "متابعة " + str(number) + " · " + old_session['title'].split(' · ')[-1][:65],
-                       "handoff": handoff, "continuation_summary": summary, "inherited_reviewed_summary": reviewed, "messages": [{"role": "user", "content":
+                       "handoff": handoff, "continuation_summary": summary, "inherited_reviewed_summary": reviewed, "messages": [{"role": "user", "kind": "continuation", "content":
                            ("متابعة تلقائية لتغيير خطة الإصلاح. الطلب الأصلي: " if reason=='repair_loop' else "متابعة تلقائية بسبب امتلاء السياق. الطلب الأصلي: ") + prompt[:6000] +
                            "\nنقطة الاستئناف: خطوة " + str(step + 1) +
                            "؛ نتائج الأوامر المكتملة محفوظة، ولن تعاد عند الاستئناف.",
@@ -1486,6 +1504,12 @@ class Studio:
         if budget < 256:
             raise ValueError('لا يتسع الطلب الفعلي مع مساحة الإخراج؛ قلّل المرفقات أو ارفع السياق')
         body['max_tokens'] = budget
+        policy = requests.get('http://127.0.0.1:18079/api/state', timeout=5)
+        policy.raise_for_status()
+        policy_state = policy.json()
+        if policy_state.get('status') != 'ready':
+            raise ValueError('النموذج غير جاهز؛ حمّله من لوحة النماذج أولًا')
+        apply_request(body, policy_state.get('parameters') or {}, allow_thought_suppression=True)
         inference_started = time.monotonic()
         request_id = uuid.uuid4().hex
         try:
@@ -1511,13 +1535,21 @@ class Studio:
         """Retry interrupted generations without replaying completed tools."""
         choice=None
         for transport_attempt in range(3):
+            with self.lock:
+                live_generation.update(reasoning='', reasoning_attempt=transport_attempt, reasoning_chars=0)
             try:
                 inference = response.studio_request
                 def measure_generation(value):
                     record_generation(job, workspace, value, inference['id'], step=step + 1,
                                       protocol=inference['protocol'], estimated_input=inference['input_tokens'])
+                def update_reasoning(fragment):
+                    with self.lock:
+                        text = live_generation.get('reasoning', '') + fragment
+                        live_generation.update(reasoning=text[-64000:], reasoning_truncated=len(text)>64000,
+                                               reasoning_chars=live_generation.get('reasoning_chars', 0)+len(fragment))
+                        job['phase'] = 'النموذج يفكّر · ' + format(live_generation['reasoning_chars'], ',') + ' حرف'
                 choice = consume(response, lambda:self.chain_pause.is_set() or job.get('cancel_requested'), update_stream,
-                                 measure=measure_generation)
+                                 measure=measure_generation, reasoning_update=update_reasoning)
                 if generation_state['protocol'] == 'json':
                     choice = decode_action(choice, request_tools)
                 generation_state.update(retries=0, invalid_rounds=0)
@@ -1536,7 +1568,8 @@ class Studio:
                 if transport_attempt == 2:
                     if recoverable:
                         generation_state['invalid_rounds']=generation_state.get('invalid_rounds',0)+1
-                        if generation_state['invalid_rounds']>=4:raise RuntimeError('تكرر تعثر التوليد رغم تغيير الخطة؛ حُفظ تقرير المحاولات دون اعتماد نجاح غير حقيقي')
+                        if generation_state['invalid_rounds']>=4:
+                            self.event('generation_recovery_continued', {'round': generation_state['invalid_rounds'], 'message': 'استمرار معالجة التوليد تلقائيًا مع حفظ الإخفاقات وتغيير خطة الإصلاح'})
                         self.event('generation_auto_recovery',{'message':'تغيير سياق الإصلاح تلقائيًا بعد ردود غير صالحة؛ لم تنفذ الأوامر الجزئية'})
                         break
                     self.event('stream_unavailable', {'message':str(transport_error)})
@@ -1578,7 +1611,7 @@ class Studio:
         if missing:
             repair_attempts += 1
             on_retry(repair_attempts)
-            if repair_attempts >= 4:
+            if repair_attempts >= 4 and not self.repair_settings()['autonomous_repair']:
                 raise RuntimeError('تقرير التسليم يذكر ملفات غير موجودة؛ لم يُعتمد: ' + ', '.join(missing))
             messages.append({'role':'user','content':'Delivery check could not resolve these file references: '+json.dumps(missing,ensure_ascii=False)+'. Check the existing file list first. A bare filename is accepted only when it identifies one project file; if multiple files share that name, cite the exact project-relative path in your answer. Do not create duplicate root copies of existing nested files. Save genuinely missing requested deliverables with tools. Never claim an unsaved file exists. If a reference was only hypothetical, clearly explain that instead. Preserve all existing tests and requirements, then validate and deliver accurately.'})
             pending_response = None
@@ -1589,7 +1622,9 @@ class Studio:
             messages.append({"role": "user", "content": "No project files were saved. Use write_file to create the requested project and tests now; a chat code block is not a delivered file."})
             repair_attempts += 1
             on_retry(repair_attempts)
-            if repair_attempts < 4:
+            if repair_attempts < 4 or self.repair_settings()['autonomous_repair']:
+                pending_response = None
+                on_progress(step + 1, pending_response)
                 return False, repair_attempts, pending_response
             raise RuntimeError("لم ينشئ النموذج ملفات المشروع؛ لم تُسجّل المهمة كتسليم ناجح.")
         with self.lock:
@@ -1629,7 +1664,7 @@ class Studio:
         repair_attempts += 1
         on_retry(repair_attempts)
         generation_state['repair'] = repair_phase(workspace,report,prompt)
-        if repair_attempts >= (8 if self.repair_settings()['autonomous_repair'] else 4):
+        if repair_attempts >= 4 and not self.repair_settings()['autonomous_repair']:
             raise RuntimeError("بقيت أخطاء أو اختبارات ناقصة بعد محاولات الإصلاح. راجع تقرير الفحص؛ لم يُعتمد التسليم.")
         messages.append({"role": "user", "content": "The required project validation failed. Read the actual errors, repair the files and add meaningful missing tests. Do not claim success yet. Report: " + json.dumps(report, ensure_ascii=False)})
         pending_response = None
@@ -1878,10 +1913,15 @@ class Studio:
             # Connection/setup failures must retain the restored cursor too.
             resume_step = start_step
             context = self.configure_agent_generation(generation_state)
-            for step in range(start_step, 128 if self.repair_settings()['autonomous_repair'] else 48):
+            autonomous = not read_only and self.repair_settings()['autonomous_repair']
+            steps = count(start_step) if autonomous else range(start_step, start_step + 48)
+            for step in steps:
                 current_step = step
                 resume_step = step
                 self.autosave(prompt, attachment_ids, state_for(step, pending_response))
+                if autonomous and step > 0 and step % 128 == 0:
+                    job['automatic_round'] = step // 128 + 1
+                    self.event('automatic_continuation', {'step': step + 1, 'round': job['automatic_round'], 'message': 'استمرار المهمة تلقائيًا من نقطة التقدم المحفوظة دون إعادة الأوامر المكتملة'})
                 with self.lock:
                     if job.get("cancel_requested"):
                         raise GenerationInterrupted()
@@ -1961,6 +2001,7 @@ class Studio:
                     if choice.get('finish_reason') == 'length':
                         self.save_partial_generation()
                     else:
+                        self.save_reasoning_generation()
                         self.save_assistant_message(choice['message'], generation_id=generation_id)
                     self.live_generation = None
                     message = choice["message"]
@@ -2275,16 +2316,21 @@ class Handler(BaseHTTPRequestHandler):
                 self.send({"error": "request rejected"}, 403)
                 return
             try:
-                metadata, content = studio.export_download(query.get("id", [""])[0], query.get("session", [""])[0])
-                self.send_response(200)
-                self.send_header("Content-Type", "application/zip")
-                self.send_header("Content-Length", str(len(content)))
-                self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(metadata["name"]))
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("X-Content-Type-Options", "nosniff")
-                self.send_header("Referrer-Policy", "no-referrer")
-                self.end_headers()
-                self.wfile.write(content)
+                metadata, archive = studio.export_download_file(query.get("id", [""])[0], query.get("session", [""])[0])
+                with archive.open('rb') as source:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/zip")
+                    self.send_header("Content-Length", str(os.fstat(source.fileno()).st_size))
+                    self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(metadata["name"]))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.send_header("Referrer-Policy", "no-referrer")
+                    self.end_headers()
+                    try:
+                        while chunk := source.read(1024 * 1024):
+                            self.wfile.write(chunk)
+                    except (BrokenPipeError, ConnectionError):
+                        return
             except (ValueError, OSError, KeyError) as error:
                 self.send({"error": str(error)}, 400)
         elif url.path == "/api/attachment":

@@ -1,6 +1,6 @@
-Local AI Project Studio4.9.3
+Local AI Project Studio4.10.3
 
-راجع README.md وRELEASE_NOTES_4.9.3.md قبل البدء.
+راجع README.md وRELEASE_NOTES_4.10.3.md قبل البدء.
 يلزم Windows x64 وPython3.13 x64 ومكونات التشغيل المطابقة لـruntime-lock.json.
 أرشيف Source code لا يشمل runtime أو wheelhouse أو أوزان GGUF.
 بعد تجهيز حزمة التشغيل المطابقة افتح Start.cmd؛ يفحص TCP18078/18079/18080 ويحرر المشغول منها بإيقاف مالكيها قبل البدء، حتى لو كانوا لبرنامج آخر.

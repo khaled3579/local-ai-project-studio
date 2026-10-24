@@ -3,13 +3,13 @@ import difflib
 import functools
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
 import threading
 import time
 import uuid
 
-MAX_BYTES = 200 * 1024 * 1024
-MAX_FILES = 5000
+CHUNK_BYTES = 1024 * 1024
 
 
 def locked(method):
@@ -76,11 +76,48 @@ class History:
             raise ValueError('رابط في النسخ الاحتياطية غير مسموح')
         return path
 
-    def blob(self, item):
-        raw = self.blob_path(item['sha256']).read_bytes()
-        if len(raw) != item['bytes'] or hashlib.sha256(raw).hexdigest() != item['sha256']:
+    def verified_blob(self, item):
+        path = self.blob_path(item['sha256'])
+        with path.open('rb') as source:
+            valid = os.fstat(source.fileno()).st_size == item['bytes'] and hashlib.file_digest(source, 'sha256').hexdigest() == item['sha256']
+        if not valid:
             raise ValueError('النسخة الاحتياطية تالفة؛ لم تبدأ استعادة الملفات')
+        return path
+
+    def blob(self, item):
+        raw = self.verified_blob(item).read_bytes()
+        if len(raw) != item['bytes'] or hashlib.sha256(raw).hexdigest() != item['sha256']:
+            raise ValueError('النسخة الاحتياطية تغيرت أثناء القراءة')
         return raw
+
+    def capture_blob(self, item):
+        from project_core import atomic_replace
+        path = self.ws.path(item['path'])
+        stat = path.stat()
+        signature = (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+        cached = self.ws.hash_cache.get(item['path'])
+        if cached and cached[0] == signature:
+            captured = {'path': item['path'], 'bytes': stat.st_size, 'sha256': cached[1]}
+            if self.blob_path(cached[1]).exists():
+                self.verified_blob(captured)
+                return captured
+        temporary = self.blob_path('0' * 64).with_name(uuid.uuid4().hex + '.tmp')
+        digest, size = hashlib.sha256(), 0
+        try:
+            with self.ws.path(item['path']).open('rb') as source, temporary.open('xb') as sink:
+                while chunk := source.read(CHUNK_BYTES):
+                    sink.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+            captured = {'path': item['path'], 'bytes': size, 'sha256': digest.hexdigest()}
+            destination = self.blob_path(captured['sha256'])
+            if destination.exists():
+                self.verified_blob(captured)
+            else:
+                atomic_replace(temporary, destination)
+            return captured
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def checkpoint(self, reason, report=None, force=False):
         from project_core import _retry_missing_file
@@ -96,28 +133,12 @@ class History:
             versions = self.versions()
             if not force and versions and versions[0]['fingerprint'] == start and versions[0]['validation'] == validation:
                 for item in versions[0]['files']:
-                    self.blob(item)  # Reused backups must still be intact before a mutation.
+                    self.verified_blob(item)  # Verify in bounded memory before a mutation.
                 return versions[0]
             candidates = self.ws.files()
-            if len(candidates) > MAX_FILES or sum(f['bytes'] for f in candidates) > MAX_BYTES:
-                raise ValueError('حفظ الإصدار يدعم حتى 5000 ملف و200MB؛ لم يبدأ التعديل')
-            files, total = [], 0
+            files = []
             for item in candidates:
-                with self.ws.path(item['path']).open('rb') as source:
-                    raw = source.read(MAX_BYTES - total + 1)
-                total += len(raw)
-                if total > MAX_BYTES:
-                    raise ValueError('تجاوزت نسخة المشروع 200MB؛ أُوقف حفظ الإصدار')
-                digest = hashlib.sha256(raw).hexdigest()
-                destination = self.blob_path(digest)
-                if not destination.exists():
-                    from project_core import atomic_replace
-                    temp = destination.with_suffix('.' + uuid.uuid4().hex + '.tmp')
-                    temp.write_bytes(raw)
-                    atomic_replace(temp, destination)
-                elif hashlib.sha256(destination.read_bytes()).hexdigest() != digest:
-                    raise ValueError('نسخة احتياطية تالفة؛ أُوقف التعديل لحماية السجل')
-                files.append({'path': item['path'], 'bytes': len(raw), 'sha256': digest})
+                files.append(self.capture_blob(item))
             captured = hashlib.sha256(json.dumps([(f['path'], f['sha256']) for f in files]).encode()).hexdigest()
             if self.ws.fingerprint() != start or captured != start:
                 raise ValueError('تغير المشروع أثناء حفظ النسخة؛ أعد المحاولة')
@@ -177,7 +198,7 @@ class History:
                 if path.relative_to(self.ws.root).as_posix() != name or '\\' in name or name.casefold() in names:
                     raise ValueError('مسار إصدار غير صالح أو متعارض')
                 names.add(name.casefold())
-                self.blob(item)
+                self.verified_blob(item)
             backup = self.checkpoint('نسخة أمان قبل استعادة إصدار')
             if backup['fingerprint'] != expected_fingerprint:
                 raise ValueError('تغير المشروع قبل الاستعادة؛ أعد المقارنة')
@@ -213,10 +234,22 @@ class History:
                 pass
         for item in version['files']:
             path = self.ws.path(item['path'])
-            if path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == item['sha256']:
-                continue
+            if path.is_file():
+                with path.open('rb') as current:
+                    if hashlib.file_digest(current, 'sha256').hexdigest() == item['sha256']:
+                        continue
             path.parent.mkdir(parents=True, exist_ok=True)
             temp = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
-            temp.write_bytes(self.blob(item))
-            atomic_replace(temp, path)
+            try:
+                digest, size = hashlib.sha256(), 0
+                with self.verified_blob(item).open('rb') as source, temp.open('xb') as sink:
+                    while chunk := source.read(CHUNK_BYTES):
+                        sink.write(chunk)
+                        digest.update(chunk)
+                        size += len(chunk)
+                if size != item['bytes'] or digest.hexdigest() != item['sha256']:
+                    raise ValueError('النسخة الاحتياطية تغيرت أثناء الاستعادة')
+                atomic_replace(temp, path)
+            finally:
+                temp.unlink(missing_ok=True)
         self.ws.hash_cache.clear()

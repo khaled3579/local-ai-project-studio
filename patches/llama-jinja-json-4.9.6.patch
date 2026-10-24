@@ -1,0 +1,63 @@
+--- 27c54b4/common/jinja/value.cpp
++++ patched/common/jinja/value.cpp
+@@ -6,6 +6,8 @@
+ #include "json.h"
+ 
+ #include <sstream>
++#include <charconv>
++#include <stdexcept>
+ #include <string>
+ #include <cctype>
+ #include <vector>
+@@ -1463,9 +1465,41 @@
+     }
+ }
+ 
++// Keep JSON serialization independent of MSVC iostream locale/facet dispatch.
++// Recorded crash: value_to_json -> basic_ostream -> basic_ios::widen -> 0xffffff00.
++// This removes that observed path; it does not assert the origin of prior memory corruption.
++class json_string_sink {
++    std::string output;
++public:
++    json_string_sink & operator<<(std::string_view text) {
++        if (!text.empty()) output.append(text.data(), text.size());
++        return *this;
++    }
++    json_string_sink & operator<<(char text) {
++        output.push_back(text);
++        return *this;
++    }
++    json_string_sink & operator<<(int64_t number) {
++        char buffer[64];
++        const auto result = std::to_chars(buffer, buffer + sizeof(buffer), number);
++        if (result.ec != std::errc{}) throw std::runtime_error("JSON integer formatting failed");
++        output.append(buffer, result.ptr);
++        return *this;
++    }
++    json_string_sink & operator<<(double number) {
++        char buffer[128];
++        // Match default ostream significant-digit precision, with JSON's decimal point.
++        const auto result = std::to_chars(buffer, buffer + sizeof(buffer), number, std::chars_format::general, 6);
++        if (result.ec != std::errc{}) throw std::runtime_error("JSON float formatting failed");
++        output.append(buffer, result.ptr);
++        return *this;
++    }
++    const std::string & str() const { return output; }
++};
++
+ // recursively convert value to JSON string
+ // TODO: avoid circular references
+-static void value_to_json_internal(std::ostringstream & oss, const value & val, int curr_lvl, int indent, const std::string_view item_sep, const std::string_view key_sep) {
++static void value_to_json_internal(json_string_sink & oss, const value & val, int curr_lvl, int indent, const std::string_view item_sep, const std::string_view key_sep) {
+     auto indent_str = [indent, curr_lvl]() -> std::string {
+         return (indent > 0) ? std::string(curr_lvl * indent, ' ') : "";
+     };
+@@ -1545,7 +1579,7 @@
+ }
+ 
+ std::string value_to_json(const value & val, int indent, const std::string_view item_sep, const std::string_view key_sep) {
+-    std::ostringstream oss;
++    json_string_sink oss;
+     value_to_json_internal(oss, val, 0, indent, item_sep, key_sep);
+     JJ_DEBUG("value_to_json: result=%s", oss.str().c_str());
+     return oss.str();

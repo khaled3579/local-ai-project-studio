@@ -97,7 +97,7 @@ def read_view(workspace, path, *, start_line=None, end_line=None, symbol=None,
     if type(outline) is not bool or type(offset) is not int or offset < 0:
         raise ValueError('Invalid outline or offset')
     if outline and (start_line is not None or end_line is not None):
-        raise ValueError('Use outline OR a line range')
+        raise ValueError('Use outline OR a line range. For definitions send {"path": "...", "outline": true} without start_line/end_line. For source lines omit outline or set it to false.')
     limit = 12000 if max_chars is None else max_chars
     if type(limit) is not int or not 1 <= limit <= 32000:
         raise ValueError('max_chars must be between 1 and 32000')
@@ -106,7 +106,7 @@ def read_view(workspace, path, *, start_line=None, end_line=None, symbol=None,
     symbol_start = None
     if outline or symbol is not None:
         if symbol is not None and (not isinstance(symbol, str) or not symbol or outline or start_line is not None or end_line is not None):
-            raise ValueError('Use a symbol OR a line range OR outline')
+            raise ValueError('Use a symbol OR a line range OR outline. Choose exactly one selector: a nonempty symbol with no start_line/end_line and outline=false or omitted; OR start_line/end_line with symbol omitted and outline=false or omitted; OR outline=true with symbol and line numbers omitted. Do not repeat the rejected arguments.')
         try:
             definitions, accuracy = _definitions(text, p.suffix)
         except (SyntaxError, ValueError, OSError, subprocess.TimeoutExpired) as error:

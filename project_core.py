@@ -72,7 +72,7 @@ def tool(name, description, properties=None, required=None):
 STRING = {"type": "string"}
 TOOLS = [
     tool("list_files", "List actual files in the selected project. Start by inspecting the project."),
-    tool("read_file", "Read current UTF-8 source with the complete-file SHA256. Prefer symbol (qualified Python/JavaScript/TypeScript function, class or method name), outline=true, or start_line/end_line. Default view is paginated at 12000 characters; follow next_read when more=true. Source excerpts are not the whole file: use patch_file for local edits; never overwrite a file with an excerpt.",
+    tool("read_file", "Read current UTF-8 source with the complete-file SHA256. Choose ONE selector: symbol (qualified function/class/method name), OR outline=true, OR start_line/end_line. Omit unused selector fields; never combine symbol with line numbers or outline=true, and never send an empty symbol. With no selector the default view is paginated at 12000 characters; follow next_read when more=true. Source excerpts are not the whole file: use patch_file for local edits; never overwrite a file with an excerpt.",
          {"path": STRING, "start_line": {"type": "integer", "minimum": 1}, "end_line": {"type": "integer", "minimum": 1},
           "symbol": STRING, "outline": {"type": "boolean"}, "offset": {"type": "integer", "minimum": 0},
           "max_chars": {"type": "integer", "minimum": 1, "maximum": 32000}}, ["path"]),

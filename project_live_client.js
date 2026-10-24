@@ -19,6 +19,70 @@
   acceptanceButton.textContent = 'أدلة القبول';
   usageBadge.insertAdjacentElement('afterend', acceptanceButton);
   let acceptanceEvidence;
+  let operationKey='';
+  function paintOperations(s) {
+    const feed=$('operationFeed'),history=$('operationHistory');if(!feed||!history)return;
+    const operations=(s.messages||[]).filter(isOperationMessage);
+    // Compact adjacent identical display rows without changing execution/history.
+    const groups=[];
+    for(const [index,message] of operations.entries()){
+      const {id,generation_id,...visible}=message;
+      const signature=JSON.stringify(visible),previous=groups[groups.length-1];
+      if(previous?.signature===signature)previous.items.push({message,index});
+      else groups.push({signature,items:[{message,index}]});
+    }
+    const events=(s.events||[]).filter(event=>!event.session_id||event.session_id===s.session_id);
+    $('answerCount').textContent=(s.messages||[]).filter(m=>!isOperationMessage(m)).length+' رسالة';
+    $('operationCount').textContent=groups.length+' مجموعة · '+operations.length+' متابعة';
+    const key=JSON.stringify([s.project,s.session_id,operations,events]);if(key===operationKey)return;
+    operationKey=key;
+    const follow=feed.scrollHeight-feed.scrollTop-feed.clientHeight<100,position=feed.scrollTop;
+    const opened=new Set([...history.querySelectorAll('details[open]')].map(row=>row.dataset.key));
+    history.replaceChildren();
+    for(const [groupIndex,group] of groups.entries()){
+      const {message,index}=group.items[0];
+      const row=document.createElement('details');row.className='operation-item '+(message.kind==='reasoning'?'reasoning':'');row.dataset.key=message.id||'message-'+index;
+      row.open=opened.has(row.dataset.key)||(groupIndex===groups.length-1&&!opened.size);
+      const title=document.createElement('summary');title.textContent=message.kind==='continuation'?'متابعة تلقائية · نقطة الاستئناف':message.kind==='reasoning'?'تفكير النموذج':message.kind==='partial'?'توليد غير مكتمل':message.kind==='recovered'?'متابعة من السجل':'خطوة معالجة · '+(index+1);
+      const body=document.createElement('div');body.className='operation-body';body.textContent=message.content||'';
+      if(group.items.length>1)title.textContent+=' · تكررت '+group.items.length+' مرات';
+      // Tool-only progress can contain the same tool name several times.
+      const names=message.tool_names||[];
+      if(names.length&&message.content==='الأدوات: '+names.join('، ')){
+        const counts=new Map();for(const name of names)counts.set(name,(counts.get(name)||0)+1);
+        body.textContent='الأدوات: '+[...counts].map(([name,count])=>name+(count>1?' × '+count:'')).join('، ');
+      }
+      row.append(title,body);history.append(row);
+      if(group.items.length>1){
+        const originals=document.createElement('details'),caption=document.createElement('summary');
+        caption.textContent='عرض المتابعات الأصلية ('+group.items.length+')';originals.append(caption);
+        for(const item of group.items){
+          const original=document.createElement('div');original.className='operation-body';
+          original.textContent='المتابعة '+(item.index+1)+'\n'+(item.message.content||'');
+          originals.append(original);
+        }
+        row.append(originals);
+      }
+    }
+    if(events.length){
+      const group=document.createElement('details');group.className='operation-item';group.dataset.key='execution-events';group.open=opened.has(group.dataset.key)||!operations.length;
+      const title=document.createElement('summary');title.textContent='سجل التنفيذ · '+events.length+' حدثًا';group.append(title);
+      for(const event of events){
+        const item=document.createElement('div');item.className='operation-body';
+        const label={tool:'استخدام أداة',file_written:'حفظ ملف',command:'تنفيذ أمر',validation:'نتيجة فحص',error:'خطأ',tool_error:'خطأ أداة',chain_paused:'حفظ نقطة استئناف',model:'معالجة النموذج',delivered:'تسليم النتيجة',version_saved:'حفظ إصدار',stream_retry:'إعادة الاتصال'}[event.kind]||event.kind;
+        const details=event.details||{};
+        item.textContent=label+'\n'+(details.path||details.name||details.message||'');
+        if(details.argv)item.textContent+='\n'+details.argv.join(' ');
+        if(details.exit_code!==undefined)item.textContent+='\nرمز الخروج: '+details.exit_code;
+        if(details.error)item.textContent+='\n'+String(details.error);
+        if(event.kind==='validation')item.textContent+='\n'+(details.success?'ناجح':'يحتاج متابعة');
+        group.append(item);
+      }
+      history.append(group);
+    }
+    if(!operations.length&&!events.length){const empty=document.createElement('div');empty.className='operation-empty';empty.textContent='ستظهر هنا خطوات المعالجة والأدوات، والتفكير إذا أرسله النموذج.';history.append(empty)}
+    feed.scrollTop=follow?feed.scrollHeight:position;
+  }
   acceptanceButton.onclick = () => {
     if (!acceptanceEvidence) return;
     const dialog = document.createElement('dialog');
@@ -62,12 +126,14 @@
 
   function paint(packet) {
     if (!state) return;
+    paintOperations(state);
     memoryButton.disabled = !state.project;
     $('saveRequirements').disabled = state.job?.status === 'running' || state.repair_run?.status === 'running' || (memoryScope && (memoryScope.project !== state.project || memoryScope.session_id !== state.session_id));
     liveBadge.textContent = connected ? 'بث مباشر' : 'تحديث دوري · إعادة اتصال البث';
     const same = packet && packet.project === state.project && packet.session_id === state.session_id;
     paintUsage(same && packet.job?.id === state.job?.id ? packet.job : state.job);
     const job = same && packet.job?.id === state.job?.id ? packet.job : state.job;
+    if($('operationPhase'))$('operationPhase').textContent=job?.status==='running'?(job.phase||'المعالجة جارية'):({paused:'المهمة متوقفة مؤقتًا؛ التقدم محفوظ',complete:'اكتملت المعالجة',cancelled:'أُوقفت المهمة',failed:'توقفت المعالجة بسبب خطأ'}[job?.status]||'لا توجد عملية نشطة');
     acceptanceEvidence = typeof job?.delivery_evidence?.requirements_coverage === 'object' ? job.delivery_evidence : null;
     acceptanceButton.disabled = !acceptanceEvidence;
     acceptanceButton.textContent = acceptanceEvidence
@@ -78,7 +144,7 @@
     if (!packet.generation || packet.job?.status !== 'running') {
       // Keep the last visible stream until the durable snapshot has caught up.
       // A completed stream is not itself a persisted conversation message.
-      const saved = old && state.messages?.some(message => message.generation_id === old.dataset.generationId);
+      const saved = old && state.messages?.some(message => message.generation_id === old.dataset.generationId || (message.kind==='reasoning'&&message.generation_id?.startsWith(old.dataset.generationId+':attempt:')));
       if (saved || !old?.children[1]?.textContent?.trim()) old?.remove();
       else if (old) {
         old.children[0].textContent = 'المساعد';
@@ -89,23 +155,27 @@
     if (state.messages?.some(message => message.generation_id === packet.generation.id && message.kind !== 'partial')) {
       old?.remove(); return;
     }
-    const nearBottom = $('chat').scrollHeight - $('chat').scrollTop - $('chat').clientHeight < 140;
+    const streamFeed=$('operationFeed')||$('chat');
+    const nearBottom = streamFeed.scrollHeight - streamFeed.scrollTop - streamFeed.clientHeight < 140;
     let box = old;
     if (!box) {
       box = document.createElement('div'); box.id = 'liveGeneration'; box.className = 'message assistant';
-      const title = document.createElement('strong'); title.textContent = 'المساعد · يولّد الآن';
+      const title = document.createElement('strong'); title.textContent = 'المعالجة المباشرة';
       const body = document.createElement('div'); body.style.whiteSpace = 'pre-wrap';
       const note = document.createElement('small'); note.className = 'hint';
-      box.append(title, body, note); $('chat').append(box);
+      const reasoning=document.createElement('div');reasoning.className='live-reasoning';reasoning.hidden=true;
+      box.append(title, body, note,reasoning); streamFeed.append(box);
     }
     box.dataset.generationId = packet.generation.id;
-    box.children[0].textContent = 'المساعد · يولّد الآن';
+    box.children[0].textContent = packet.generation.reasoning&&!packet.generation.text?'النموذج يفكّر الآن':'صياغة الرد وتجهيز العمليات';
     // Never parse unfinished Markdown/HTML or tool JSON as executable content.
     box.children[1].textContent = packet.generation.text || 'جارٍ تجهيز الرد…';
     box.children[2].textContent = packet.generation.tools?.filter(Boolean).length
       ? 'تجهيز الأدوات: ' + packet.generation.tools.filter(Boolean).join('، ') + ' · التنفيذ بعد اكتمال الرد'
       : 'عرض أثناء التوليد · يعتمد التسليم على الفحص النهائي';
-    if (nearBottom) $('chat').scrollTop = $('chat').scrollHeight;
+    const thinking=box.children[3];thinking.hidden=!packet.generation.reasoning;
+    thinking.textContent=(packet.generation.reasoning_truncated?'مقتطف من نهاية التفكير:\n':'تفكير النموذج:\n')+(packet.generation.reasoning||'');
+    if (nearBottom) streamFeed.scrollTop = streamFeed.scrollHeight;
   }
   const previousRender = render;
   render = function (s) { previousRender(s); paint(latest); };

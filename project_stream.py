@@ -16,9 +16,9 @@ class GenerationStalled(ValueError):
     pass
 
 
-def repeated_suffix(text):
-    tail=text[-2048:]
-    for width in range(1,81):
+def repeated_suffix(text, *, max_width=80):
+    tail=text[-max(2048,max_width*12):]
+    for width in range(1,max_width+1):
         count=max(12,384//width)
         if len(tail)<width*count:continue
         unit=tail[-width:]
@@ -36,7 +36,7 @@ def abort_response(response):
     response.close()
 
 
-def consume(response, interrupted, update, *, progress_timeout=45, total_timeout=240, measure=None):
+def consume(response, interrupted, update, *, progress_timeout=45, total_timeout=240, measure=None, reasoning_update=None):
     inbox = queue.Queue(maxsize=64)
     stopped = threading.Event()
 
@@ -68,6 +68,9 @@ def consume(response, interrupted, update, *, progress_timeout=45, total_timeout
     total_timeout = getattr(response, 'generation_total_timeout', total_timeout)
     progress_tail=''
     last_scan=0
+    reasoning_tail=''
+    reasoning_size=0
+    reasoning_scan=0
     try:
         while True:
             if interrupted():
@@ -91,6 +94,8 @@ def consume(response, interrupted, update, *, progress_timeout=45, total_timeout
                 continue
             data = line[5:].strip()
             if data == '[DONE]':
+                if repeated_suffix(reasoning_tail,max_width=256):
+                    raise GenerationStalled('اكتُشف تكرار نصي داخل التفكير؛ أُلغي التوليد دون تنفيذ أدواته الجزئية')
                 if finish not in {'stop', 'tool_calls', 'length'}:
                     raise ValueError('بث النموذج بلا علامة إكمال صالحة')
                 message = {'role':'assistant', 'content':text}
@@ -119,6 +124,22 @@ def consume(response, interrupted, update, *, progress_timeout=45, total_timeout
                 continue
             choice = choices[0]
             delta = choice.get('delta') or {}
+            reasoning = delta.get('reasoning_content') or delta.get('reasoning')
+            if isinstance(reasoning, str) and reasoning:
+                # Thinking is real generation progress, but never an executable action.
+                last_progress = time.monotonic()
+                if first_token is None:
+                    first_token = round(last_progress - started, 6)
+                if reasoning_update is not None:
+                    reasoning_update(reasoning)
+                # Reasoning is a separate stream: normal output may remain empty
+                # throughout a thinking loop, bypassing the content/tool scanner.
+                reasoning_tail=(reasoning_tail+reasoning)[-4096:]
+                reasoning_size+=len(reasoning)
+                if reasoning_size-reasoning_scan>=128:
+                    reasoning_scan=reasoning_size
+                    if repeated_suffix(reasoning_tail,max_width=256):
+                        raise GenerationStalled('اكتُشف تكرار نصي داخل التفكير؛ أُلغي التوليد دون تنفيذ أدواته الجزئية')
             content = delta.get('content') or ''
             previous_size = size
             text += content

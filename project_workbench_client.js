@@ -29,7 +29,7 @@
    <div class="wb-quality-summary"><div class="wb-metric"><small>الحالة الحالية</small><strong id="qualityState">لم يُفحص</strong></div><div class="wb-metric"><small>طبقات ناجحة</small><strong id="qualityLayers">—</strong></div><div class="wb-metric"><small>اختبارات منفّذة فعليًا</small><strong id="qualityTests">—</strong></div><div class="wb-metric"><small>طبقات تحتاج متابعة</small><strong id="qualityFailures">—</strong></div></div>
    <p class="wb-quality-note" id="qualityNote"></p><div class="wb-checks" id="qualityChecks"></div>
   </section>`;
-  $('chat').before(bench);
+  ($('conversationLayout')||$('chat')).before(bench);
   let view='chat', file=null, fileProject=null, serial=0, saving=false, opening=false, draftTimer, qualityKey='', qualityBusy=false, qualityData=null, qualityURL=null, fileListKey='', previewURL=null, comparedDiskHash=null;
   let localStorageRef;try{localStorageRef=localStorage;}catch(_){localStorageRef={getItem(){return null},setItem(){throw Error('storage unavailable')},removeItem(){}};}
   const drafts=new EditorDrafts(localStorageRef);

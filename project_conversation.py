@@ -17,7 +17,10 @@ def assistant_entry(job_id, message, *, kind='progress', generation_id=None):
     key = 'assistant:' + hashlib.sha256(identity.encode('utf-8')).hexdigest()
     if kind == 'partial' and generation_id:
         key = 'partial:' + str(job_id) + ':' + generation_id
+    if kind == 'reasoning' and generation_id:
+        key = 'reasoning:' + str(job_id) + ':' + generation_id
     return {'id': key, 'job_id': job_id, 'role': 'assistant', 'content': content,
+            'tool_names': names,
             'verified': False, 'kind': kind, 'transcript_only': True,
             **({'generation_id': generation_id} if generation_id else {})}
 
@@ -38,6 +41,16 @@ def conversation_view(sessions, session_id, checkpoints):
     result = []
     for session in reversed(chain):
         rows = list(session.get('messages', []))
+        # Identify legacy handoffs only in explicit continuation sessions.
+        # Copy the display row without changing durable messages or model context.
+        if session.get('parent_id') and session.get('continuation_number') and rows:
+            first = rows[0]
+            text = first.get('content')
+            if (first.get('role') == 'user' and isinstance(text, str)
+                    and not any(key in first for key in ('mode', 'draft_edit_id'))
+                    and text.startswith(('متابعة تلقائية لتغيير خطة الإصلاح. الطلب الأصلي: ',
+                                         'متابعة تلقائية بسبب امتلاء السياق. الطلب الأصلي: '))):
+                rows[0] = {**first, 'kind': 'continuation'}
         known_ids = {row.get('id') for row in rows if row.get('id')}
         known_text = {row.get('content') for row in rows if row.get('role') == 'assistant' and isinstance(row.get('content'), str)}
         for state in reversed(checkpoints):

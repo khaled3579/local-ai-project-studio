@@ -101,7 +101,8 @@ class ModelLibrary:
         self.lock = threading.RLock()
         self.folder = str(default_folder)
         self.models, self.auxiliary, self.errors = [], [], []
-        self.status, self.error = 'idle', None
+        self.status = 'idle'
+        self.error: str | None = None
         self.picking = False
         try:
             saved = json.loads(self.path.read_text(encoding='utf-8'))
