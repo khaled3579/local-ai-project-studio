@@ -25,10 +25,11 @@ from project_zip import inspect_zip, extract_zip
 from project_export import build_export
 from project_recovery import Recovery, RecoveryReview
 from project_loop_guard import LoopGuard
+from project_code_tools import diagnostic_path
 from project_drafts import Drafts
 from project_requirements import Requirements
 from project_stream import consume, GenerationInterrupted, GenerationStalled
-from project_generation import request_body, decode_action, json_messages, validation_feedback, repair_focus, repair_phase, ActionFormatError, action_progress, output_budget, generation_timeouts
+from project_generation import request_body, decode_action, json_messages, validation_feedback, repair_focus, repair_phase, ActionFormatError, action_progress, output_budget, generation_timeouts, sampler_grammar_failure
 from project_workbench import action as workbench_action
 from app_maintenance import append_activity, console_logging
 from project_intent import task_mode, SAFE_CHAT_TOOLS, CHAT_SYSTEM
@@ -1410,6 +1411,43 @@ class Studio:
                         raise ValueError('السؤال غير صالح')
                     return {'waiting_for_user':True, 'question':question.strip(), 'id':call['id']}
                 invoke = ask_user_operation
+            elif name == 'diagnose_project':
+                def diagnostic_operation():
+                    if not hub(workspace).enabled.get('diagnostics', True):
+                        raise ValueError('هذه المجموعة معطلة في مركز الأدوات')
+                    if set(arguments) - {'path'}:
+                        return workspace.invoke(name, arguments)
+                    fingerprint = workspace.fingerprint()
+                    cache = generation_state.setdefault('diagnostic_cache', {})
+                    if cache.get('fingerprint') != fingerprint:
+                        cache.clear()
+                        cache.update(fingerprint=fingerprint, entries={})
+                    entries = cache['entries']
+                    request_key = 'request:' + json.dumps(arguments, sort_keys=True, ensure_ascii=False)
+                    if request_key in entries:
+                        return {**entries[request_key], 'reused_diagnostic': True, 'note': 'الطلب نفسه والملفات لم تتغير؛ استخدم النتيجة المحفوظة وصحح المسار عند وجود خطأ.'}
+                    try:
+                        path = diagnostic_path(workspace, arguments.get('path', ''))
+                    except (OSError, ValueError) as error:
+                        result = {'error': str(error), 'not_executed': True,
+                                  'repair_hint': 'For the project use diagnose_project({}) or path=".". For a file/folder select an existing relative path from list_files. Do not repeat rejected arguments.'}
+                        if len(entries) >= 32:
+                            entries.clear()
+                        entries[request_key] = result
+                        self.event('tool_error', {'name': name, 'error': str(error)})
+                        return result
+                    canonical_key = 'scope:' + path
+                    if canonical_key in entries:
+                        return {**entries[canonical_key], 'reused_diagnostic': True}
+                    result = workspace.invoke(name, {'path': path})
+                    result = {**result, 'diagnostic_scope': path or '.', 'requested_path': arguments.get('path', '')}
+                    if len(entries) >= 32:
+                        entries.clear()
+                    entries[request_key] = result
+                    entries[canonical_key] = result
+                    return result
+                from project_toolhub import hub
+                invoke = diagnostic_operation
             elif name == 'acceptance_plan':
                 def acceptance_operation():
                     req = self.requirements().load()
@@ -1491,42 +1529,69 @@ class Studio:
 
     def request_agent_generation(self, *, workspace: Workspace, job, prompt, generation_state,
                                  context: int, messages, request_tools, read_only: bool, step: int) -> GenerationResponse:
-        """Build and account for exactly the request sent to the local model."""
-        latest=workspace.last_validation() or {}
-        available = max(256, context - job.get('context_tokens', 0) - 512)
-        budget = output_budget(prompt, generation_state, available)
-        body = request_body(
-            project_messages(messages), request_tools, available,
-            protocol=generation_state['protocol'], attempt=generation_state['retries'], repair=generation_state.get('repair',False), thought_token=generation_state.get('thought_token'), allow_final=read_only or bool(latest.get('success') and latest.get('current')), output_tokens=budget)
-        # Count the actual protocol/tools and repair instruction, not a global catalog.
-        request_input = token_count(body['messages'], body.get('tools', []))
-        budget = min(budget, context - request_input - 512)
-        if budget < 256:
-            raise ValueError('لا يتسع الطلب الفعلي مع مساحة الإخراج؛ قلّل المرفقات أو ارفع السياق')
-        body['max_tokens'] = budget
+        """Account for every request; recover only known pre-generation grammar failures."""
         policy = requests.get('http://127.0.0.1:18079/api/state', timeout=5)
         policy.raise_for_status()
         policy_state = policy.json()
         if policy_state.get('status') != 'ready':
             raise ValueError('النموذج غير جاهز؛ حمّله من لوحة النماذج أولًا')
-        apply_request(body, policy_state.get('parameters') or {}, allow_thought_suppression=True)
-        inference_started = time.monotonic()
-        request_id = uuid.uuid4().hex
-        try:
-            response = requests.post(MODEL_URL + '/v1/chat/completions', json=body, stream=True, timeout=(10, 240))
-        except requests.RequestException:
-            record_generation(job, workspace, {'outcome': 'connection_error', 'seconds': time.monotonic() - inference_started},
-                              request_id, step=step + 1, protocol=generation_state['protocol'], estimated_input=request_input)
-            raise
-        if response.status_code != 200:
-            record_generation(job, workspace, {'outcome': 'http_error', 'http_status': response.status_code, 'seconds': time.monotonic() - inference_started},
-                              request_id, step=step + 1, protocol=generation_state['protocol'], estimated_input=request_input)
-        # Large input prefills must not be mistaken for hidden token loops.
-        initial_timeout, total_timeout = generation_timeouts(job.get('context_tokens',0), budget)
-        job['generation_budget'] = {'output_tokens':budget, 'initial_timeout':initial_timeout, 'total_timeout':total_timeout}
-        return GenerationResponse(response, started=inference_started, request_id=request_id,
-                                  protocol=generation_state['protocol'], input_tokens=request_input,
-                                  initial_timeout=initial_timeout, total_timeout=total_timeout)
+        identity = [str((policy_state.get('active') or {}).get('model', '')), policy_state.get('pid')]
+        compatibility = generation_state.get('tool_compatibility') or {}
+        if compatibility and compatibility.get('identity') != identity:
+            generation_state['protocol'] = compatibility.get('original_protocol', generation_state['protocol'])
+            generation_state.pop('tool_compatibility', None)
+            compatibility = {}
+        # At most required -> auto -> grammar-free text, never replaying a tool.
+        for fallback_attempt in range(3):
+            if self.chain_pause.is_set() or self.chain_stop.is_set() or job.get('cancel_requested'):
+                raise GenerationInterrupted()
+            latest = workspace.last_validation() or {}
+            available = max(256, context - job.get('context_tokens', 0) - 512)
+            budget = output_budget(prompt, generation_state, available)
+            mode = compatibility.get('mode')
+            body = request_body(
+                project_messages(messages), request_tools, available,
+                protocol=generation_state['protocol'], attempt=generation_state['retries'],
+                repair=generation_state.get('repair',False), thought_token=generation_state.get('thought_token'),
+                allow_final=read_only or bool(latest.get('success') and latest.get('current')), output_tokens=budget,
+                tool_choice_auto=mode == 'auto', grammar_free=mode == 'text')
+            request_input = token_count(body['messages'], body.get('tools', []))
+            budget = min(budget, context - request_input - 512)
+            if budget < 256:
+                raise ValueError('لا يتسع الطلب الفعلي مع مساحة الإخراج؛ قلّل المرفقات أو ارفع السياق')
+            body['max_tokens'] = budget
+            apply_request(body, policy_state.get('parameters') or {}, allow_thought_suppression=True)
+            inference_started = time.monotonic()
+            request_id = uuid.uuid4().hex
+            try:
+                response = requests.post(MODEL_URL + '/v1/chat/completions', json=body, stream=True, timeout=(10, 240))
+            except requests.RequestException:
+                record_generation(job, workspace, {'outcome': 'connection_error', 'seconds': time.monotonic() - inference_started},
+                                  request_id, step=step + 1, protocol=generation_state['protocol'], estimated_input=request_input)
+                raise
+            if response.status_code != 200:
+                record_generation(job, workspace, {'outcome': 'http_error', 'http_status': response.status_code, 'seconds': time.monotonic() - inference_started},
+                                  request_id, step=step + 1, protocol=generation_state['protocol'], estimated_input=request_input)
+                if (not read_only and fallback_attempt < 2 and mode != 'text'
+                        and sampler_grammar_failure(response.status_code, response.text)):
+                    original_protocol = compatibility.get('original_protocol', generation_state['protocol'])
+                    mode = 'auto' if generation_state['protocol'] == 'native' and mode != 'auto' else 'text'
+                    detail = response.text[:1500]
+                    response.close()
+                    compatibility = {'identity': identity, 'mode': mode, 'original_protocol': original_protocol}
+                    generation_state['tool_compatibility'] = compatibility
+                    if mode == 'text':
+                        generation_state['protocol'] = 'json'
+                    self.event('tool_compatibility_changed', {'mode': mode, 'http_status': 400, 'error': detail,
+                        'message': 'تغيير بروتوكول الأدوات تلقائيًا لمعالجة تعارض القواعد؛ شروط التسليم محفوظة'})
+                    job['phase'] = 'معالجة توافق الأدوات تلقائيًا'
+                    continue
+            initial_timeout, total_timeout = generation_timeouts(job.get('context_tokens',0), budget)
+            job['generation_budget'] = {'output_tokens':budget, 'initial_timeout':initial_timeout, 'total_timeout':total_timeout}
+            return GenerationResponse(response, started=inference_started, request_id=request_id,
+                                      protocol=generation_state['protocol'], input_tokens=request_input,
+                                      initial_timeout=initial_timeout, total_timeout=total_timeout)
+        raise RuntimeError('تعذر اختيار بروتوكول متوافق؛ لم تنفذ أي أداة جزئية')
 
     def consume_agent_generation(self, response: GenerationResponse, *, workspace: Workspace, job, prompt,
                                  generation_state, request_tools, read_only: bool, step: int,
@@ -1551,7 +1616,7 @@ class Studio:
                 choice = consume(response, lambda:self.chain_pause.is_set() or job.get('cancel_requested'), update_stream,
                                  measure=measure_generation, reasoning_update=update_reasoning)
                 if generation_state['protocol'] == 'json':
-                    choice = decode_action(choice, request_tools)
+                    choice = decode_action(choice, request_tools, strict=(generation_state.get('tool_compatibility') or {}).get('mode') == 'text')
                 generation_state.update(retries=0, invalid_rounds=0)
                 break
             except GenerationInterrupted:
@@ -1606,6 +1671,14 @@ class Studio:
             messages.append({'role':'user','content':'Answer the current question with nonempty text; do not modify or validate the project.'})
             pending_response = None
             on_progress(step + 1, pending_response)
+            return False, repair_attempts, pending_response
+        if not final.strip():
+            repair_attempts += 1
+            on_retry(repair_attempts)
+            messages.append({'role': 'user', 'content': 'Your last response had no user-facing answer. Reasoning alone is not a final report. Write a concise Arabic summary of actual findings, changes (or explicitly no changes), saved validation results and remaining limitations. Reuse the existing receipts; do not rerun passing checks merely to write the summary.'})
+            pending_response = None
+            on_progress(step + 1, pending_response)
+            self.event('empty_final_rejected', {'message': 'طلب تقرير نصي للمستخدم؛ التفكير وحده لا يعتمد تسليمًا'})
             return False, repair_attempts, pending_response
         missing = missing_delivery_files(workspace, final)
         if missing:
@@ -1972,11 +2045,17 @@ class Studio:
                             job['phase'] = 'توليد الرد مباشرة' + (' · تجهيز: ' + ', '.join(visible_tools) if visible_tools else (' · استقبال ' + format(len(text), ',') + ' حرف' if text else ''))
                     request_tools = active_tools
                     def generate():
-                        return self.request_agent_generation(
+                        generated = self.request_agent_generation(
                             workspace=workspace, job=job, prompt=prompt,
                             generation_state=generation_state, context=context,
                             messages=messages, request_tools=request_tools,
                             read_only=read_only, step=step)
+                        try:
+                            self.autosave(prompt, attachment_ids, state_for(step))
+                        except BaseException:
+                            generated.close()
+                            raise
+                        return generated
                     response = generate()
                     if response.status_code != 200:
                         detail = response.text.lower()

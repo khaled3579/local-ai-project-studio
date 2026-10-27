@@ -15,8 +15,31 @@ FLAGS=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0
 SOURCE={'.py','.pyw','.js','.jsx','.ts','.tsx','.mjs','.cjs','.html','.css','.json','.md','.toml','.yaml','.yml','.txt','.sql'}
 
 
-def sources(ws, path=''):
-    if path:
+def diagnostic_path(ws, path=''):
+    """Canonicalize an existing diagnostic scope without widening missing paths."""
+    if not isinstance(path, str):
+        raise ValueError('diagnose_project.path must be text; omit it to inspect the project')
+    candidate = (ws.root / path).resolve()
+    if candidate == ws.root:
+        return ''
+    item = ws.path(path)  # Preserve containment, excluded-path and Windows checks.
+    if not item.exists():
+        raise ValueError('Diagnostic path does not exist. Use list_files and select an existing project file/folder; omit path only when whole-project diagnostics are intended.')
+    return item.relative_to(ws.root).as_posix()
+
+
+def sources(ws, path='', *, allow_directory=False):
+    if allow_directory:
+        path = diagnostic_path(ws, path)
+        if not path:
+            rows = ws.files()
+        elif ws.path(path).is_dir():
+            prefix = path.rstrip('/') + '/'
+            rows = [row for row in ws.files() if row['path'].startswith(prefix)]
+        else:
+            item = ws.path(path)
+            rows = [{'path': path, 'bytes': item.stat().st_size}]
+    elif path:
         item=ws.path(path)
         if not item.is_file():raise ValueError('اختر ملفًا موجودًا داخل المشروع')
         rows=[{'path':item.relative_to(ws.root).as_posix(),'bytes':item.stat().st_size}]
@@ -64,7 +87,7 @@ def search(ws, query, mode='text', path='', limit=30):
 
 
 def diagnose(ws,path=''):
-    rows=sources(ws,path);python=[r['path'] for r in rows if Path(r['path']).suffix in {'.py','.pyw'}]
+    rows=sources(ws,path,allow_directory=True);python=[r['path'] for r in rows if Path(r['path']).suffix in {'.py','.pyw'}]
     script=[r['path'] for r in rows if Path(r['path']).suffix in {'.js','.jsx','.ts','.tsx','.mjs','.cjs'}]
     results=[];start=time.monotonic();env=os.environ.copy();env['PYTHONUTF8']='1'
     from project_browser_tools import private

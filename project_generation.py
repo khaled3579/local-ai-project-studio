@@ -2,6 +2,7 @@
 import json
 import uuid
 import re
+import math
 from project_context import inspection_guidance
 
 
@@ -61,7 +62,14 @@ def action_schema(tools, repair=False, allow_final=True):
     return {'oneOf':variants}
 
 
-def request_body(messages, tools, limit, *, protocol='native', attempt=0, repair=False, thought_token=None, allow_final=True, output_tokens=4096):
+def sampler_grammar_failure(status, detail):
+    """Only known sampler/grammar initialization failures may change protocol."""
+    text = str(detail).lower()
+    return status == 400 and 'failed to initialize samplers' in text and (
+        'unexpected empty grammar stack' in text or 'failed to parse grammar' in text)
+
+
+def request_body(messages, tools, limit, *, protocol='native', attempt=0, repair=False, thought_token=None, allow_final=True, output_tokens=4096, tool_choice_auto=False, grammar_free=False):
     guidance = inspection_guidance(messages, tools)
     body = {'messages':messages, 'max_tokens':min(output_tokens, limit), 'stream':True,
             'stream_options': {'include_usage': True}}
@@ -71,10 +79,11 @@ def request_body(messages, tools, limit, *, protocol='native', attempt=0, repair
         body['logit_bias']={str(thought_token):False}
     if protocol == 'json':
         body['messages'] = json_messages(messages, tools)
-        body['response_format'] = {'type':'json_schema', 'json_schema':{
-            'name':'project_action', 'strict':True, 'schema':action_schema(tools,repair,allow_final)}}
+        if not grammar_free:
+            body['response_format'] = {'type':'json_schema', 'json_schema':{
+                'name':'project_action', 'strict':True, 'schema':action_schema(tools,repair,allow_final)}}
     else:
-        body.update(tools=tools, tool_choice='auto' if allow_final else 'required', parallel_tool_calls=False)
+        body.update(tools=tools, tool_choice='auto' if allow_final or tool_choice_auto else 'required', parallel_tool_calls=False)
     if repair or not allow_final:
         body['messages']=[dict(m) for m in body['messages']]
         instruction='Give ONE brief observable diagnosis (JSON message field for JSON actions), then execute one targeted repair or diagnostic. Preserve tests. No long analysis, no placeholder output.'
@@ -159,7 +168,58 @@ def action_progress(text, tools, protocol):
     return preview,([name.group(1)] if name and name.group(1)!='final' else [])
 
 
-def decode_action(choice, tools):
+def validate_action_value(value, schema, path='arguments', depth=0):
+    """Validate the exposed tool-schema subset before grammar-free execution."""
+    if depth > 64:
+        raise ActionFormatError('Action nesting too deep')
+    kind = schema.get('type')
+    types = {'object': isinstance(value, dict), 'array': isinstance(value, list),
+             'string': isinstance(value, str), 'integer': type(value) is int,
+             'number': type(value) in (int, float), 'boolean': type(value) is bool,
+             'null': value is None}
+    if kind is not None and not types.get(kind, False):
+        raise ActionFormatError(path + ': expected ' + str(kind))
+    if 'enum' in schema and value not in schema['enum']:
+        raise ActionFormatError(path + ': unsupported value')
+    if 'const' in schema and value != schema['const']:
+        raise ActionFormatError(path + ': unexpected value')
+    if isinstance(value, dict):
+        properties = schema.get('properties', {})
+        if any(key not in value for key in schema.get('required', [])):
+            raise ActionFormatError(path + ': missing required fields')
+        for key, item in value.items():
+            if key in properties:
+                validate_action_value(item, properties[key], path + '.' + key, depth + 1)
+            elif schema.get('additionalProperties') is False:
+                raise ActionFormatError(path + ': unexpected field ' + key)
+    elif isinstance(value, list):
+        if not schema.get('minItems', 0) <= len(value) <= schema.get('maxItems', len(value)):
+            raise ActionFormatError(path + ': array length outside schema')
+        if 'items' in schema:
+            for index, item in enumerate(value):
+                validate_action_value(item, schema['items'], path + '[' + str(index) + ']', depth + 1)
+    elif isinstance(value, str):
+        if not schema.get('minLength', 0) <= len(value) <= schema.get('maxLength', len(value)):
+            raise ActionFormatError(path + ': string length outside schema')
+    elif type(value) in (int, float):
+        if not math.isfinite(value) or value < schema.get('minimum', value) or value > schema.get('maximum', value):
+            raise ActionFormatError(path + ': number outside schema')
+
+
+def unique_action_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ActionFormatError('Duplicate action field: ' + key)
+        result[key] = value
+    return result
+
+
+def invalid_action_constant(value):
+    raise ActionFormatError('Non-finite JSON constant: ' + value)
+
+
+def decode_action(choice, tools, *, strict=False):
     if choice.get('finish_reason') == 'length':
         return choice
     if choice['message'].get('tool_calls'):
@@ -167,11 +227,18 @@ def decode_action(choice, tools):
     text = choice['message'].get('content', '').strip()
     if text.startswith('```json') and text.endswith('```'):
         text = text[7:-3].strip()
-    try:action = json.loads(text)
+    try:
+        action = (json.loads(text, object_pairs_hook=unique_action_object, parse_constant=invalid_action_constant)
+                  if strict else json.loads(text))
     except json.JSONDecodeError as error:raise ActionFormatError('Invalid action JSON: '+str(error)) from error
+    except RecursionError:raise ActionFormatError('Action nesting too deep') from None
     if not isinstance(action, dict) or set(action) - {'tool','arguments','message'}:
         raise ActionFormatError('Invalid action object')
+    if strict and 'message' in action and not isinstance(action['message'], str):
+        raise ActionFormatError('Action message must be text')
     name = action.get('tool')
+    if strict and name != 'final' and len(action.get('message', '')) > 600:
+        raise ActionFormatError('Action diagnosis exceeds schema length')
     if name == 'final':
         if action.get('arguments') or not isinstance(action.get('message'),str) or not action['message'].strip():
             raise ActionFormatError('Empty or invalid final delivery')
@@ -180,6 +247,8 @@ def decode_action(choice, tools):
     args = action.get('arguments')
     if not tool or not isinstance(args,dict):raise ActionFormatError('Unknown tool or invalid arguments')
     schema = tool['parameters']
+    if strict:
+        validate_action_value(args, schema)
     if set(args) - set(schema.get('properties',{})) or any(k not in args for k in schema.get('required',[])):
         raise ActionFormatError(str(name)+': required arguments='+json.dumps(schema.get('required',[]))+
             '; missing='+json.dumps([k for k in schema.get('required',[]) if k not in args])+

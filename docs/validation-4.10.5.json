@@ -1,0 +1,33 @@
+{
+  "version": "4.10.5",
+  "new_tests_run_for_publication": 0,
+  "new_model_generations_for_publication": 0,
+  "evidence_scope": "Historical receipts plus selected installed-source SHA256 comparison; no tests rerun.",
+  "historical_static_receipts": {
+    "4.10.4": {
+      "filesAnalyzed": 2,
+      "errorCount": 0,
+      "warningCount": 0
+    },
+    "4.10.5": {
+      "filesAnalyzed": 4,
+      "errorCount": 0,
+      "warningCount": 0
+    }
+  },
+  "selected_source_sha256": {
+    "project_generation.py": "38cc3b8d8e4547a69b1ec144bec9b88e0d04bd246d66d68e43987b0fce6c5cb7",
+    "project_studio.py": "dd0f7ad16aac1ff056ade37cc92bff26e4066f1084ead3692d85a07ad1f26a7e",
+    "project_code_tools.py": "f4d4065f4220722d545adb103a4c99c207c93eca6b3d760fb0744d53f4dc58a8",
+    "project_toolhub.py": "9577d7ab1cbc34e16e2017fb5f825f8fe41a28172b052b447cbc413c9b2a47b7",
+    "project_conversation.py": "9a7335301506573ed765186cf2025b14f4d5ee743d47063c81b255bff3f23251"
+  },
+  "user_state_uploaded": false,
+  "runtime_zip_uploaded": false,
+  "limitations": [
+    "No new functional or model inference proof.",
+    "No new token or performance measurements.",
+    "Recorded type diagnostics are historical, scoped receipts.",
+    "Source archives exclude binary runtime."
+  ]
+}
