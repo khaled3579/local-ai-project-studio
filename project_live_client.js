@@ -145,7 +145,7 @@
       // Keep the last visible stream until the durable snapshot has caught up.
       // A completed stream is not itself a persisted conversation message.
       const saved = old && state.messages?.some(message => message.generation_id === old.dataset.generationId || (message.kind==='reasoning'&&message.generation_id?.startsWith(old.dataset.generationId+':attempt:')));
-      if (saved || !old?.children[1]?.textContent?.trim()) old?.remove();
+      if (saved || old?.dataset.hasOutput !== 'true') old?.remove();
       else if (old) {
         old.children[0].textContent = 'المساعد';
         old.children[2].textContent = 'آخر رد ظاهر · جارٍ تحديث سجل المحادثة';
@@ -167,9 +167,10 @@
       box.append(title, body, note,reasoning); streamFeed.append(box);
     }
     box.dataset.generationId = packet.generation.id;
+    box.dataset.hasOutput = packet.generation.text || packet.generation.reasoning ? 'true' : 'false';
     box.children[0].textContent = packet.generation.reasoning&&!packet.generation.text?'النموذج يفكّر الآن':'صياغة الرد وتجهيز العمليات';
     // Never parse unfinished Markdown/HTML or tool JSON as executable content.
-    box.children[1].textContent = packet.generation.text || 'جارٍ تجهيز الرد…';
+    box.children[1].textContent = packet.generation.text || (packet.generation.reasoning ? 'النموذج يفكّر…' : 'تجهيز سياق الطلب قبل أول توكن…');
     box.children[2].textContent = packet.generation.tools?.filter(Boolean).length
       ? 'تجهيز الأدوات: ' + packet.generation.tools.filter(Boolean).join('، ') + ' · التنفيذ بعد اكتمال الرد'
       : 'عرض أثناء التوليد · يعتمد التسليم على الفحص النهائي';

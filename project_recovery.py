@@ -23,6 +23,7 @@ class Recovery:
             db.execute('PRAGMA journal_mode=WAL')
             db.execute('CREATE TABLE IF NOT EXISTS checkpoints(run_id TEXT PRIMARY KEY, updated REAL, payload TEXT, digest TEXT)')
             db.execute('CREATE TABLE IF NOT EXISTS calls(run_id TEXT, job_id TEXT, call_id TEXT, name TEXT, arguments TEXT, status TEXT, result TEXT, pid INTEGER, created REAL, PRIMARY KEY(run_id,job_id,call_id))')
+            db.execute('CREATE TABLE IF NOT EXISTS execution_receipts(run_id TEXT, name TEXT, arguments TEXT, fingerprint TEXT, job_id TEXT, call_id TEXT, PRIMARY KEY(run_id,name,arguments,fingerprint))')
 
     @contextmanager
     def connect(self):
@@ -79,6 +80,29 @@ class Recovery:
                 if row['status'] == 'started':
                     raise RecoveryReview('انقطع التنفيذ أثناء أمر ولم تُحفظ نتيجته؛ لن يُعاد تلقائيًا')
                 return json.loads(row['result'])
+            # A regenerated ID does not authorize replaying an operation whose
+            # outcome is uncertain. Preserve the existing review gate.
+            uncertain = db.execute("SELECT 1 FROM calls WHERE run_id=? AND name=? AND arguments=? AND status='started'",
+                                   (state['run_id'], name, args)).fetchone()
+            if uncertain:
+                raise RecoveryReview('أمر مطابق ملتبس محفوظ؛ لن يعاد بمعرّف جديد')
+            # Only successful source writes and completed commands have durable
+            # receipts. Never reuse validation/browser/acceptance evidence or
+            # process lifecycle operations from a different call.
+            if name in {'write_file', 'patch_file', 'run_command'}:
+                previous = db.execute('SELECT c.* FROM execution_receipts r JOIN calls c ON '
+                    'c.run_id=r.run_id AND c.job_id=r.job_id AND c.call_id=r.call_id '
+                    'WHERE r.run_id=? AND r.name=? AND r.arguments=? AND r.fingerprint=?',
+                    (state['run_id'], name, args, state['fingerprint'])).fetchone()
+                if previous and previous['status'] == 'completed':
+                    value = json.loads(previous['result'])
+                    value = {**value, 'reused_execution': True,
+                             'original_call_id': previous['call_id'],
+                             'note': 'Already executed on this unchanged source; not executed again.'}
+                    self._save(db, state)
+                    db.execute('INSERT INTO calls(run_id,job_id,call_id,name,arguments,status,result) VALUES(?,?,?,?,?,?,?)',
+                        (state['run_id'], state['job']['id'], call_id, name, args, 'completed', json.dumps(value, ensure_ascii=False)))
+                    return value
             self._save(db, state)
             db.execute('INSERT INTO calls(run_id,job_id,call_id,name,arguments,status) VALUES(?,?,?,?,?,?)',
                        (state['run_id'], state['job']['id'], call_id, name, args, 'started'))
@@ -97,6 +121,14 @@ class Recovery:
         with self.connect() as db:
             db.execute('UPDATE calls SET status=?,result=? WHERE run_id=? AND job_id=? AND call_id=?',
                        (status, json.dumps(result, ensure_ascii=False), state['run_id'], state['job']['id'], call_id))
+            row = db.execute('SELECT name,arguments FROM calls WHERE run_id=? AND job_id=? AND call_id=?',
+                             (state['run_id'], state['job']['id'], call_id)).fetchone()
+            if (row and status == 'completed' and not result.get('error') and not result.get('not_executed')
+                    and not result.get('timed_out') and not result.get('waiting_for_user')
+                    and ((row['name'] in {'write_file', 'patch_file'} and result.get('saved') and result.get('sha256'))
+                         or (row['name'] == 'run_command' and result.get('exit_code') == 0))):
+                db.execute('INSERT OR REPLACE INTO execution_receipts VALUES(?,?,?,?,?,?)',
+                    (state['run_id'], row['name'], row['arguments'], state['fingerprint'], state['job']['id'], call_id))
             self._save(db, state)
 
     def calls(self, run_id):

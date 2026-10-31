@@ -11,14 +11,16 @@ FIXED={'daily_ai.py','daily_models.html','model_library.py','model_folder_picker
        'app_runtime.py','app_package.py','app_updates.py','app_maintenance.py','requirements.txt','requirements.lock.txt','runtime-lock.json',
        'Launch-Daily.ps1','Launch-Projects.ps1','Prepare-Runtime.ps1','Update-App.ps1','Rollback-App.ps1','Doctor.ps1',
        'Daily-AI.cmd','Daily-Projects.cmd','PACKAGE_README_AR.txt'}
+FIXED.update({'Prepare-Tabby.ps1', 'README_ENGINES_AR.txt'})
 FIXED.update({'Start.cmd', 'Stop.cmd', 'Start-All.ps1', 'Stop-All.ps1', 'README_START_AR.txt'})
 
 
 def build(root,destination,version='4.0.0'):
     root=Path(root).resolve();destination=Path(destination).resolve();destination.parent.mkdir(parents=True,exist_ok=True)
     files=[root/name for name in FIXED]
+    files += [p for p in root.glob('model_*') if p.suffix in {'.py','.js'}]
     files += [p for p in root.glob('project_*') if p.suffix in {'.py','.html','.js','.css'}]
-    files += [p for folder in ('runtime','wheelhouse') for p in (root/folder).rglob('*') if p.is_file() and not (folder=='runtime' and p.name=='debug.log' and p.is_relative_to(root/'runtime/browser'))]
+    files += [p for folder in ('runtime','wheelhouse') for p in (root/folder).rglob('*') if p.is_file() and not p.is_relative_to(root/'runtime/tabbyapi') and not (folder=='runtime' and p.name=='debug.log' and p.is_relative_to(root/'runtime/browser'))]
     if any(not p.is_file() or p.is_symlink() or not p.resolve().is_relative_to(root) for p in files):raise ValueError('حزمة ناقصة أو مسار غير صالح')
     release=json.dumps({'version':version,'data_schema':1,'minimum_schema':1,'created':time.time(),'platform':'Windows-x64-Python313'},indent=2).encode()
     manifest={'format':1,'release':version,'data_schema':1,'files':{p.relative_to(root).as_posix():{'sha256':digest(p),'bytes':p.stat().st_size} for p in sorted(set(files))}}

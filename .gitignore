@@ -28,3 +28,12 @@ APP-MANIFEST.json
 *.safetensors
 *.pem
 *.key
+
+
+# Private engineering evidence and unrelated workspaces
+engineering/
+metatrader5/
+tmp/
+output/
+.env
+.env.*

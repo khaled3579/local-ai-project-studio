@@ -78,7 +78,7 @@ def consume(response, interrupted, update, *, progress_timeout=45, total_timeout
             now = time.monotonic()
             if now - started > total_timeout:
                 raise GenerationStalled('بلغ التوليد ميزانية الوقت الكلية؛ أُلغي الرد الجزئي دون تنفيذ أدواته')
-            if now - last_progress > (progress_timeout if size else initial_timeout):
+            if now - last_progress > (progress_timeout if first_token is not None else initial_timeout):
                 raise GenerationStalled('توقف تقدم التوليد؛ أُلغي الرد الجزئي لتغيير خطة التوليد تلقائيًا')
             try:
                 line = inbox.get(timeout=.1)

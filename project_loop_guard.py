@@ -83,6 +83,10 @@ class LoopGuard:
         history = self.state['observations']
         history.append(row)
         del history[:-500]
+        # Invalid model output is a protocol failure, not evidence of a defect
+        # in the user's source. Its bounded recovery belongs to the caller.
+        if name == 'generation_loop':
+            return None
         recent = history[-12:]
         reason = None
         if error:
@@ -158,6 +162,13 @@ class LoopGuard:
         if not self.state['changes']:
             return None
         latest = self.state['changes'][-1]
+        if latest.get('trigger_tool') == 'generation_loop':
+            # Old checkpoints retain their complete diagnostic history, but
+            # must never reapply an obsolete source-repair plan on resume.
+            return ('TOOL PROTOCOL RECOVERY: The rejected response was not executed. '
+                    'Preserve the current implementation and completed evidence. '
+                    'Return one valid action for the remaining original requirements; '
+                    'a formatting error is not a reason to repair source or reinstall dependencies.')
         return ('AUTOMATIC REPAIR PLAN CHANGE ' + str(latest['number']) + '\n' + latest['plan'] +
                 '\nDo not repeat unchanged reads/commands already evidenced. Do not ask the user about repairable errors. '
                 'First state your new hypothesis briefly, then execute the alternative plan. Completed durable calls must not be replayed. '

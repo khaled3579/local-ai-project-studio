@@ -1,6 +1,7 @@
 """Validated, per-model inference settings and their declared provenance."""
 import json
 import math
+import re
 from pathlib import Path
 
 
@@ -31,6 +32,8 @@ GENERATION = {
     'reasoning_budget_tokens': field('ميزانية التفكير — ‎-1 افتراضي', -1, '--reasoning-budget', minimum=-1, integer=True),
 }
 RUNTIME = {
+    'devices': field('بطاقات المحرك — auto أو CUDA0,CUDA1', 'auto', '--device'),
+    'main_gpu': field('البطاقة الأساسية ضمن القائمة المختارة', 0, '--main-gpu', minimum=0, integer=True),
     'gpu_layers': field('طبقات GPU', 99, '--n-gpu-layers', minimum=-1, integer=True),
     'split_mode': field('توزيع العمل بين البطاقات', 'layer', '--split-mode', choices=['layer', 'row', 'none']),
     'tensor_split': field('نسب البطاقات — مثل 1,1', '1,1', '--tensor-split'),
@@ -57,6 +60,9 @@ def validate_group(group, value):
         if spec['choices'] is not None:
             if item not in spec['choices'] or (spec['integer'] and type(item) is not int):
                 raise ValueError('قيمة غير مدعومة: ' + spec['label'])
+        elif key == 'devices':
+            if not isinstance(item, str) or (item != 'auto' and not re.fullmatch(r'CUDA\d+(?:,CUDA\d+)*', item)) or len(set(item.split(','))) != len(item.split(',')):
+                raise ValueError('اختر auto أو قائمة معرفات CUDA غير مكررة')
         elif key == 'tensor_split':
             if not isinstance(item, str):
                 raise ValueError('نسب البطاقات يجب أن تكون نصًا مثل 1,1')
@@ -146,6 +152,8 @@ def arguments(settings):
     for group, fields in SCHEMA.items():
         for key, spec in fields.items():
             value = settings['values'][group][key]
+            if key == 'devices' and value == 'auto' or key == 'main_gpu' and value == 0:
+                continue
             argv.extend([spec['flag'], str(value)])
     for sequence in settings.get('stop', []):
         argv.extend(['--reverse-prompt', sequence])

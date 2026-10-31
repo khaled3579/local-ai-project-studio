@@ -1,0 +1,21 @@
+{
+  "version": "4.14.3",
+  "new_tests_run_for_publication": 0,
+  "project_tests_run_for_publication": 0,
+  "new_model_requests_for_publication": 0,
+  "runtime_uploaded": false,
+  "user_state_uploaded": false,
+  "historical_validation": {
+    "4.14.3": {
+      "isolated_format_checks": 10,
+      "earlier_recovery_checks": 6,
+      "scope": "Mocked protocol and temporary recovery database; not full project delivery proof."
+    }
+  },
+  "limitations": [
+    "No new end-to-end project or model performance proof.",
+    "Source archives exclude optional engine binaries, local installation receipts and model weights.",
+    "Saved project remains paused; publication does not resume jobs.",
+    "Legacy execution records are not retroactively assigned unproven source fingerprints."
+  ]
+}

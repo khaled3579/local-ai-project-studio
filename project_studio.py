@@ -26,6 +26,7 @@ from project_export import build_export
 from project_recovery import Recovery, RecoveryReview
 from project_loop_guard import LoopGuard
 from project_code_tools import diagnostic_path
+from project_tool_protocol import select_protocol, remember_protocol
 from project_drafts import Drafts
 from project_requirements import Requirements
 from project_stream import consume, GenerationInterrupted, GenerationStalled
@@ -1535,13 +1536,20 @@ class Studio:
         policy_state = policy.json()
         if policy_state.get('status') != 'ready':
             raise ValueError('النموذج غير جاهز؛ حمّله من لوحة النماذج أولًا')
-        identity = [str((policy_state.get('active') or {}).get('model', '')), policy_state.get('pid')]
         compatibility = generation_state.get('tool_compatibility') or {}
-        if compatibility and compatibility.get('identity') != identity:
-            generation_state['protocol'] = compatibility.get('original_protocol', generation_state['protocol'])
-            generation_state.pop('tool_compatibility', None)
-            compatibility = {}
-        # At most required -> auto -> grammar-free text, never replaying a tool.
+        if not read_only:
+            compatibility, warnings = select_protocol(generation_state, policy_state)
+            recovery = generation_state.get('format_recovery') or {}
+            if recovery and (recovery.get('fingerprint') != workspace.fingerprint()
+                             or recovery.get('identity') != compatibility.get('identity')):
+                generation_state.pop('format_recovery', None)
+            job['tool_protocol'] = {'protocol': generation_state['protocol'], 'mode': compatibility['mode'], 'selection': compatibility['selection']}
+            for warning in warnings:
+                if generation_state.get('tool_protocol_warning') != warning:
+                    self.event('tool_protocol_cache_error', {'error': warning})
+                    generation_state['tool_protocol_warning'] = warning
+        # Native tools start with auto, avoiding forced eager grammar. Known
+        # incompatible templates use grammar-free JSON before the first request.
         for fallback_attempt in range(3):
             if self.chain_pause.is_set() or self.chain_stop.is_set() or job.get('cancel_requested'):
                 raise GenerationInterrupted()
@@ -1561,10 +1569,19 @@ class Studio:
                 raise ValueError('لا يتسع الطلب الفعلي مع مساحة الإخراج؛ قلّل المرفقات أو ارفع السياق')
             body['max_tokens'] = budget
             apply_request(body, policy_state.get('parameters') or {}, allow_thought_suppression=True)
+            if (not read_only and mode == 'text'
+                    and generation_state.get('format_recovery', {}).get('failures', 0)
+                    and 'qwen' in str((policy_state.get('active') or {}).get('model', '')).lower()):
+                # Request-local Qwen template recovery; never overwrite saved
+                # sampling/model settings or reintroduce a rejected grammar.
+                body.setdefault('chat_template_kwargs', {})['enable_thinking'] = False
+            initial_timeout, total_timeout = generation_timeouts(request_input, budget, model_state=policy_state)
+            job['generation_budget'] = {'output_tokens':budget, 'initial_timeout':initial_timeout, 'total_timeout':total_timeout}
+            job['phase'] = 'تجهيز سياق الطلب قبل أول توكن · ' + format(request_input, ',') + ' توكن'
             inference_started = time.monotonic()
             request_id = uuid.uuid4().hex
             try:
-                response = requests.post(MODEL_URL + '/v1/chat/completions', json=body, stream=True, timeout=(10, 240))
+                response = requests.post(MODEL_URL + '/v1/chat/completions', json=body, stream=True, timeout=(10, max(240, initial_timeout + 30)))
             except requests.RequestException:
                 record_generation(job, workspace, {'outcome': 'connection_error', 'seconds': time.monotonic() - inference_started},
                                   request_id, step=step + 1, protocol=generation_state['protocol'], estimated_input=request_input)
@@ -1575,19 +1592,21 @@ class Studio:
                 if (not read_only and fallback_attempt < 2 and mode != 'text'
                         and sampler_grammar_failure(response.status_code, response.text)):
                     original_protocol = compatibility.get('original_protocol', generation_state['protocol'])
-                    mode = 'auto' if generation_state['protocol'] == 'native' and mode != 'auto' else 'text'
+                    rejected_route = 'native_auto' if generation_state['protocol'] == 'native' else 'json_schema'
+                    mode = 'text'
                     detail = response.text[:1500]
                     response.close()
-                    compatibility = {'identity': identity, 'mode': mode, 'original_protocol': original_protocol}
+                    compatibility = {**compatibility, 'mode': mode, 'original_protocol': original_protocol}
                     generation_state['tool_compatibility'] = compatibility
-                    if mode == 'text':
-                        generation_state['protocol'] = 'json'
+                    generation_state['protocol'] = 'json'
+                    try:
+                        remember_protocol(compatibility['identity'], mode, reason='observed_sampler_grammar_failure', rejected_route=rejected_route)
+                    except (OSError, ValueError, TypeError) as error:
+                        self.event('tool_protocol_cache_error', {'error': str(error)})
                     self.event('tool_compatibility_changed', {'mode': mode, 'http_status': 400, 'error': detail,
                         'message': 'تغيير بروتوكول الأدوات تلقائيًا لمعالجة تعارض القواعد؛ شروط التسليم محفوظة'})
                     job['phase'] = 'معالجة توافق الأدوات تلقائيًا'
                     continue
-            initial_timeout, total_timeout = generation_timeouts(job.get('context_tokens',0), budget)
-            job['generation_budget'] = {'output_tokens':budget, 'initial_timeout':initial_timeout, 'total_timeout':total_timeout}
             return GenerationResponse(response, started=inference_started, request_id=request_id,
                                       protocol=generation_state['protocol'], input_tokens=request_input,
                                       initial_timeout=initial_timeout, total_timeout=total_timeout)
@@ -1622,21 +1641,52 @@ class Studio:
             except GenerationInterrupted:
                 raise
             except (requests.RequestException, ValueError, TimeoutError) as transport_error:
+                rejected_choice = choice
                 choice=None
                 if isinstance(transport_error, ActionFormatError):
                     totals = job.setdefault('token_usage', {})
                     totals['rejected_actions'] = totals.get('rejected_actions', 0) + 1
+                    fingerprint = workspace.fingerprint()
+                    recovery = generation_state.setdefault('format_recovery', {})
+                    identity = (generation_state.get('tool_compatibility') or {}).get('identity')
+                    if recovery.get('fingerprint') != fingerprint or recovery.get('identity') != identity:
+                        recovery.clear()
+                        recovery.update(fingerprint=fingerprint, identity=identity, failures=0)
+                    recovery['failures'] += 1
+                    # Record a bounded local diagnostic, not the full generated
+                    # source or reasoning. Failed responses remain unexecutable.
+                    rejected = (rejected_choice or {}).get('message') or {}
+                    self.event('action_format_rejected', {
+                        'error': str(transport_error), 'failures': recovery['failures'],
+                        'finish_reason': (rejected_choice or {}).get('finish_reason'),
+                        'content_chars': len(rejected.get('content') or ''),
+                        'content_prefix': (rejected.get('content') or '')[:160]})
+                    if recovery['failures'] >= 6:
+                        job['transport_error'] = str(transport_error)
+                        self.save_assistant_message({'content':
+                            'تعذر تثبيت صيغة استدعاء الأدوات بعد محاولات التعافي؛ حُفظت نقطة الاستئناف دون إعادة الأدوات أو اعتماد التسليم.'}, kind='connection_error')
+                        self.event('tool_protocol_recovery_exhausted', {'message':
+                            'توقف التعافي المتكرر على ملفات لم تتغير؛ التقدم محفوظ', 'failures': recovery['failures']})
+                        raise GenerationInterrupted()
                 recoverable=isinstance(transport_error,(ActionFormatError,GenerationStalled)) and not read_only and self.repair_settings()['autonomous_repair']
                 if recoverable:
                     guard.observe('generation_loop',{}, {'error':str(transport_error)},workspace.fingerprint(),step)
-                    messages.append({'role':'user','content':'The previous generation was discarded without executing its partial action. Correct this diagnostic: '+str(transport_error)+'. Return ONE valid small action matching the exact tool schema. Do not repeat placeholder text. Existing sources need patch_file, missing files use write_file.'})
+                    from project_generation import action_format_feedback
+                    # Keep only the latest format correction in the working
+                    # prompt. Every rejection remains in durable diagnostics.
+                    messages[:] = [m for m in messages if not (m.get('role') == 'user' and
+                        str(m.get('content', '')).startswith(('The previous response was REJECTED',
+                            'The previous generation was discarded without executing its partial action. Correct this diagnostic:')))]
+                    messages.append({'role':'user','content':action_format_feedback(transport_error, request_tools)})
                 if transport_attempt == 2:
                     if recoverable:
                         generation_state['invalid_rounds']=generation_state.get('invalid_rounds',0)+1
                         if generation_state['invalid_rounds']>=4:
                             self.event('generation_recovery_continued', {'round': generation_state['invalid_rounds'], 'message': 'استمرار معالجة التوليد تلقائيًا مع حفظ الإخفاقات وتغيير خطة الإصلاح'})
-                        self.event('generation_auto_recovery',{'message':'تغيير سياق الإصلاح تلقائيًا بعد ردود غير صالحة؛ لم تنفذ الأوامر الجزئية'})
+                        self.event('generation_auto_recovery',{'message':'إصلاح صيغة الرد مع إبقاء سياق المهمة؛ لم تنفذ الأوامر الجزئية'})
                         break
+                    job['transport_error'] = str(transport_error)
+                    self.save_assistant_message({'content': 'تعذر إكمال اتصال النموذج: ' + str(transport_error) + '\nحُفظ التقدم ونقطة الاستئناف؛ لم يُعتمد التسليم.'}, kind='connection_error')
                     self.event('stream_unavailable', {'message':str(transport_error)})
                     job['phase'] = 'تعذر البث بعد ثلاث محاولات؛ حُفظ التقدم'
                     raise GenerationInterrupted()
@@ -1794,6 +1844,18 @@ class Studio:
         generation_state.setdefault('review_required', bool(model_name))
         if generation_state.get('protocol_version') != 3:
             generation_state.update(protocol_version=3,retries=0,invalid_rounds=0)
+        if self.require_job().get('mode') != 'chat':
+            compatibility, warnings = select_protocol(generation_state, manager_state)
+            self.require_job()['tool_protocol'] = {'protocol': generation_state['protocol'], 'mode': compatibility['mode'], 'selection': compatibility['selection']}
+            selection_key = compatibility['identity'] + ':' + compatibility['mode']
+            if generation_state.get('tool_protocol_notice') != selection_key:
+                self.event('tool_protocol_selected', {**self.require_job()['tool_protocol'],
+                    'message': 'اختير بروتوكول الأدوات تلقائيًا من بصمة النموذج والقالب والمحرك؛ شروط التسليم محفوظة'})
+                generation_state['tool_protocol_notice'] = selection_key
+            for warning in warnings:
+                if generation_state.get('tool_protocol_warning') != warning:
+                    self.event('tool_protocol_cache_error', {'error': warning})
+                    generation_state['tool_protocol_warning'] = warning
         if ('gemma-4' in model_name or 'gemma4' in model_name) and generation_state.get('token_model') != model_name:
             response=requests.post(MODEL_URL+'/tokenize',json={'content':'<|channel>','add_special':False,'parse_special':True},timeout=10)
             response.raise_for_status();ids=response.json().get('tokens',[])
@@ -1983,6 +2045,30 @@ class Studio:
                 pending_response = resume_state.get('pending_response')
                 requested_images = resume_state.get('requested_images', [])
                 messages[0] = {'role':'system', 'content':system_prompt}
+            if not read_only and generation_state.get('protocol_recovery_version') != 2:
+                # Remove obsolete injected instructions only from the model's
+                # working context. Transcripts, ledger and old plans stay intact.
+                obsolete = [c for c in guard.state['changes'] if c.get('trigger_tool') == 'generation_loop']
+                messages = [m for m in messages if not (
+                    m.get('role') == 'user'
+                    and str(m.get('content', '')).startswith('AUTOMATIC REPAIR PLAN CHANGE ')
+                    and any(str(m['content']).startswith('AUTOMATIC REPAIR PLAN CHANGE ' + str(c['number']) + '\n') for c in obsolete))]
+                previous_recovery = generation_state.pop('format_recovery', None)
+                generation_state['protocol_recovery_version'] = 2
+                messages = [m for m in messages if not (m.get('role') == 'user' and
+                    str(m.get('content', '')).startswith(('The previous response was REJECTED',
+                        'The previous generation was discarded without executing its partial action. Correct this diagnostic:')))]
+                from project_generation import action_format_feedback
+                messages.append({'role':'user', 'content':action_format_feedback('Tool history representation upgraded; use the current action format', active_tools)})
+                self.event('tool_history_upgraded', {'version':2,
+                    'previous_format_failures': (previous_recovery or {}).get('failures', 0),
+                    'message':'توحيد صيغة الأدوات التاريخية؛ السجلات ونقطة الاستئناف محفوظة'})
+                messages.append({'role':'user', 'content':
+                    'Continue the original deliverable from the files and committed evidence. '
+                    'Tool-response formatting failures are not project defects. '
+                    'Passing tests cover only implemented behavior, not the entire specification. '
+                    'Keep every requirement in the original attached specification, including the requested GUI. '
+                    'Identify the next missing deliverable and implement it; do not restart inspection or replace the requested product with a reduced CLI.'})
             # Connection/setup failures must retain the restored cursor too.
             resume_step = start_step
             context = self.configure_agent_generation(generation_state)
@@ -2007,7 +2093,7 @@ class Studio:
                     if not read_only and self.repair_settings()['autonomous_repair'] and len(guard.state['changes']) > generation_state.get('context_replans',0):
                         intervention = intervention or guard.current_plan()
                     if intervention:
-                        if guard.state['changes'][-1].get('trigger_tool') != 'acceptance_plan' and not guard.state['changes'][-1].get('preserve_context'):
+                        if guard.state['changes'][-1].get('trigger_tool') not in {'acceptance_plan', 'generation_loop'} and not guard.state['changes'][-1].get('preserve_context'):
                             rotate(step,min(8000,context-4608),reason='repair_loop')
                         generation_state['context_replans']=len(guard.state['changes'])
                         messages.append({'role':'user','content':repair_focus(workspace,workspace.last_validation() or {},prompt)})
@@ -2018,6 +2104,13 @@ class Studio:
                     used = token_count(json_messages(model_messages, active_tools), []) if generation_state['protocol'] == 'json' else token_count(model_messages, active_tools)
                     desired_output = output_budget(prompt, generation_state, context - 2048)
                     threshold = min(int(context * self.repair_settings()['context_percent'] / 100), context - desired_output - 512)
+                    if used >= threshold:
+                        # A forced early rollover cannot reduce the immutable
+                        # prefix. Match the handoff budget before deciding to
+                        # rotate, instead of failing before the first request.
+                        prefix = [messages[0], {'role':'user','content':'Continue the current task.'}]
+                        prefix_used = token_count(json_messages(project_messages(prefix), active_tools), []) if generation_state['protocol'] == 'json' else token_count(project_messages(prefix), active_tools)
+                        threshold = compaction_budget(context, prefix_used, threshold)
                     job.update(context_tokens=used, context_limit=context, context_threshold=threshold)
                     if used >= threshold:
                         rotate(step, min(threshold, context - 4608))
@@ -2168,6 +2261,7 @@ class Studio:
             self.save_partial_generation()
             self.live_generation = None
             job['transport_error'] = str(error)
+            self.save_assistant_message({'content': 'تعذر إكمال اتصال النموذج: ' + str(error) + '\nحُفظ التقدم ونقطة الاستئناف؛ لم يُعتمد التسليم.'}, kind='connection_error')
             self.event('stream_unavailable', {'message':str(error)})
             self.pause_checkpoint('within_attempt', prompt, attachment_ids, state_for(resume_step, pending_response))
             return 'paused'

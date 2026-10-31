@@ -88,4 +88,4 @@ async function initParameters(){
   $('apply').onclick=()=>{try{parameterConfig();apply()}catch(error){showError(error.message)}};
   renderParameters();
 }
-initParameters().catch(error=>{showError(error.message);$('apply').disabled=true});
+const parameterReady=initParameters().catch(error=>{showError(error.message);$('apply').disabled=true});
