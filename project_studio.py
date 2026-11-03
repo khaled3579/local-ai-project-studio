@@ -1704,7 +1704,11 @@ class Studio:
                     # Record a bounded local diagnostic, not the full generated
                     # source or reasoning. Failed responses remain unexecutable.
                     rejected = (rejected_choice or {}).get('message') or {}
-                    from project_generation import patch_recovery_target
+                    from project_generation import patch_recovery_target, remember_new_file_recovery
+                    creation=remember_new_file_recovery(rejected.get('content') or '',workspace,generation_state)
+                    if creation:
+                        self.event('small_creation_recovery',{'path':creation,
+                            'message':'تعافي إنشاء ملف كبير بهيكل صغير ثم رقع؛ لا تنفيذ للنص المرفوض ولا تخفيف للتسليم'})
                     target = patch_recovery_target(rejected.get('content') or '', workspace)
                     if target:
                         targets = generation_state.setdefault('patch_recovery_targets', [])
@@ -1735,7 +1739,7 @@ class Studio:
                         str(m.get('content', '')).startswith(('The previous response was REJECTED',
                             'The previous generation was discarded without executing its partial action. Correct this diagnostic:')))]
                     messages.append({'role':'user','content':action_format_feedback(transport_error, request_tools,
-                        generation_state.get('patch_recovery_targets', []))})
+                        generation_state.get('patch_recovery_targets', []), generation_state.get('new_file_recovery_targets', []))})
                 if transport_attempt == 2:
                     if recoverable:
                         generation_state['invalid_rounds']=generation_state.get('invalid_rounds',0)+1
@@ -2209,6 +2213,21 @@ class Studio:
                     self.event('small_patch_recovery_upgraded', {'paths':targets,
                         'previous_format_failures':previous.get('failures', 0),
                         'message':'ترحيل التعافي إلى رقع صغيرة مع إبقاء الإخفاقات ونقطة الاستئناف'})
+            if not read_only and generation_state.get('small_creation_recovery_version') != 1:
+                from project_generation import remember_new_file_recovery, action_format_feedback
+                for event in self.events:
+                    detail=event.get('details',{})
+                    if event.get('kind')=='action_format_rejected' and event.get('job_id')==job['id']:
+                        remember_new_file_recovery(detail.get('content_prefix') or '',workspace,generation_state,
+                            size=detail.get('content_chars',0))
+                generation_state['small_creation_recovery_version']=1
+                creations=generation_state.get('new_file_recovery_targets',[])
+                if creations:
+                    messages.append({'role':'user','content':action_format_feedback(
+                        'Large creation rejected; continue with a small valid starting skeleton and patches',active_tools,
+                        generation_state.get('patch_recovery_targets',[]),creations)})
+                    self.event('small_creation_recovery_upgraded',{'paths':creations,
+                        'message':'استعادة تعافي إنشاء الملفات مع إبقاء السجل وشروط التسليم'})
             resume_step = start_step
             context = self.configure_agent_generation(generation_state)
             autonomous = not read_only and self.repair_settings()['autonomous_repair']
@@ -2320,13 +2339,27 @@ class Studio:
                     self.live_generation = None
                     message = choice["message"]
                     if choice.get('finish_reason') == 'length':
-                        generation_state.update(protocol='json', retries=generation_state['retries'] + 1)
+                        # Exhausting output tokens is not evidence of a tool
+                        # grammar failure. Keep the working protocol; actual
+                        # schema/transport failures retain their own fallback.
+                        generation_state['retries'] += 1
                         from project_generation import patch_recovery_target, action_format_feedback
                         hints = [message.get('content') or '']
                         for call in message.get('tool_calls', []):
                             function = call.get('function') or {}
                             if function.get('name') == 'write_file':
                                 hints.append('{"tool":"write_file","arguments":' + (function.get('arguments') or ''))
+                        from project_generation import remember_new_file_recovery
+                        creations=[target for text in hints if
+                            (target:=remember_new_file_recovery(text,workspace,generation_state))]
+                        if creations:
+                            messages.append({'role':'user','content':action_format_feedback(
+                                'Output limit reached; no partial actions executed',active_tools,
+                                generation_state.get('patch_recovery_targets',[]),generation_state['new_file_recovery_targets'])})
+                            self.event('small_creation_recovery',{'paths':creations,
+                                'message':'بلغ إنشاء الملف حد الرد؛ متابعة بهيكل صغير ثم رقع دون تنفيذ النص الناقص'})
+                            self.autosave(prompt,attachment_ids,state_for(step+1))
+                            continue
                         patch_targets = [target for text in hints if
                             (target := patch_recovery_target(text, workspace))]
                         if patch_targets:

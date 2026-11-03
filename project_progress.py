@@ -190,11 +190,24 @@ def cached_read(state,workspace,name,arguments,invoke,epoch):
     if not path.is_file() or path.stat().st_size>2*1024*1024:return invoke()
     with path.open('rb') as stream:
         fingerprint=hashlib.file_digest(stream,'sha256').hexdigest()
-    key=digest([str(workspace.root),arguments,fingerprint,epoch]);cache=state.setdefault('read_cache',{})
+    # Model reads have explicit bounded defaults. Canonicalize only those
+    # defaults, retaining selectors and types so invalid requests still reach
+    # validation and a legacy max_chars=None read is never a paged read.
+    allowed={'path','offset','max_chars','outline','start_line','end_line','symbol'}
+    if set(arguments)-allowed:return invoke()
+    view={'offset':0,'max_chars':12000,'outline':False,
+          'start_line':None,'end_line':None,'symbol':None,**arguments}
+    if type(view['offset']) is not int or type(view['outline']) is not bool:return invoke()
+    view['path']=path.relative_to(workspace.root).as_posix()
+    key=digest(['read-view-v2',str(workspace.root),view,fingerprint,epoch]);cache=state.setdefault('read_cache',{})
     if key in cache:return {**cache[key],'reused_read':True}
     result=invoke()
-    if not result.get('error') and result.get('sha256')==fingerprint and len(json.dumps(result,ensure_ascii=False))<=12000:
-        if len(cache)>=4:cache.pop(next(iter(cache)))
+    # A normal 12000-character page plus metadata exceeds 12000 serialized
+    # characters. Permit any supported page while bounding the entire saved
+    # cache (including metadata), not just its number of entries.
+    if not result.get('error') and result.get('sha256')==fingerprint and len(json.dumps(result,ensure_ascii=False))<=131072:
+        while cache and (len(cache)>=24 or len(json.dumps(cache,ensure_ascii=False))+len(json.dumps({key:result},ensure_ascii=False))>262144):
+            cache.pop(next(iter(cache)))
         cache[key]=result
     return result
 

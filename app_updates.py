@@ -175,11 +175,23 @@ def install(root,package,sha,stop=False,self_check=True,fail_after=None):
         import py_compile
         for name in manifest['files']:
             if name.endswith('.py') and '/' not in name:py_compile.compile(str(stage/name),doraise=True)
-        from app_runtime import prepare
-        prepared=prepare(stage,activate=False) if self_check else None
-        if self_check:
+        bundled=any(name.startswith(('runtime/','wheelhouse/')) for name in manifest['files'])
+        if self_check and bundled:
+            from app_runtime import prepare
+            prepared=prepare(stage,activate=False)
             result=subprocess.run([prepared['python'],'-I',str(stage/'app_runtime.py'),'--root',str(stage),'self-test'],capture_output=True,text=True,encoding='utf-8',timeout=60,creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
             if result.returncode:raise RuntimeError('فشل فحص الحزمة المعزول: '+result.stderr[-2000:])
+        elif self_check:
+            # Source-only releases have no staged wheels/binaries. Reuse the
+            # verified installed environment only for identical dependency
+            # locks. New dependencies require a complete bundled release.
+            for name in ('runtime-lock.json','requirements.lock.txt'):
+                if not (root/name).is_file() or not (stage/name).is_file() or digest(root/name)!=digest(stage/name):
+                    raise ValueError('Source update requires identical installed runtime dependency locks; use a full package for changed dependencies')
+            from app_runtime import selected, run_probe
+            run_probe(root,selected(root))
+            # Source was compiled above. The complete installed self-test
+            # below remains mandatory and rolls all code back on failure.
         if stop:stopped=stop_services(root)
         else:require_offline(root);stopped=[]
         backup=contained(root,'.updates/backups/'+identifier);backup.mkdir(parents=True)

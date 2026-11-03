@@ -15,7 +15,7 @@ from scripted_model import scripted_transport, review_fixture
 
 
 class StudioIntegration(unittest.TestCase):
-    def run_controller(self, protocol, unsafe_write=False, premature_final=False, autonomous=False, review_in_agent=False, repeat_read=False, recover_validation=False):
+    def run_controller(self, protocol, unsafe_write=False, premature_final=False, autonomous=False, review_in_agent=False, repeat_read=False, recover_validation=False, large_creation=None):
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)
             root = directory / 'project'
@@ -54,6 +54,9 @@ class StudioIntegration(unittest.TestCase):
                         {'start':0,'end':boundary,'evidence_kind':'behavior'},
                         {'start':boundary,'end':len(block['text']),'evidence_kind':'behavior'}]}]}))
             sent = []
+            if large_creation:
+                actions[:0]=[('write_file',{'path':'database.py','content':'VALUE = 0\n'+'# padding\n'*600}),
+                             ('write_file',{'path':'database.py','content':'VALUE = 1\n'})]
 
             def post(url, **kwargs):
                 if url.endswith('/apply-template'):
@@ -67,9 +70,13 @@ class StudioIntegration(unittest.TestCase):
                 if protocol == 'json':
                     content = json.dumps({'tool': name, 'arguments': arguments} if name else {'tool': 'final', 'message': 'تم إصلاح `app.py` والتحقق منه.'})
                     delta, finish = {'content': content}, 'stop'
+                    if large_creation and len(sent)==1:
+                        if large_creation=='invalid':delta['content']=content[:-2]
+                        else:finish='length'
                 elif name:
                     delta = {'tool_calls': [{'index': 0, 'id': f'c{len(sent)}', 'function': {'name': name, 'arguments': json.dumps(arguments)}}]}
                     finish = 'tool_calls'
+                    if large_creation=='length' and len(sent)==1:finish='length'
                 else:
                     delta, finish = {'content': 'تم إصلاح `app.py` والتحقق منه.'}, 'stop'
                 response = Response([{'choices': [{'delta': delta, 'finish_reason': finish}]},
@@ -102,8 +109,19 @@ class StudioIntegration(unittest.TestCase):
             self.assertIn('return a + b', (root / 'app.py').read_text(encoding='utf-8'))
             self.assertIn('UNRELATED = 42', (root / 'app.py').read_text(encoding='utf-8'))
             self.assertTrue(json.loads((studio.workspace.meta / 'delivery-evidence.json').read_text(encoding='utf-8'))['validated'])
-            self.assertEqual(len(studio.recovery().calls('integration-run')), (6 if premature_final else 5)+int(review_in_agent)+int(repeat_read)+3*int(recover_validation))
+            self.assertEqual(len(studio.recovery().calls('integration-run')), (6 if premature_final else 5)+int(review_in_agent)+int(repeat_read)+3*int(recover_validation)+int(bool(large_creation)))
+            if large_creation:
+                self.assertEqual((root/'database.py').read_text(),'VALUE = 1\n')
+                self.assertIn('starting skeleton',json.dumps(sent[1],ensure_ascii=False))
+                self.assertTrue(any(e['kind']=='small_creation_recovery' for e in studio.events))
+                if protocol=='native' and large_creation=='length':
+                    self.assertIn('tools',sent[1])
+                    self.assertNotIn('response_format',sent[1])
             saved = studio.recovery().load('integration-run')
+            if large_creation:
+                self.assertIn('database.py',saved['agent_state']['generation_state']['new_file_recovery_targets'])
+                if protocol=='native' and large_creation=='length':
+                    self.assertEqual(saved['agent_state']['generation_state']['protocol'],'native')
             self.assertFalse(saved['agent_state']['read_coverage']['app.py']['complete'])
             self.assertIn('continuation',saved['agent_state'])
             self.assertTrue(saved['agent_state']['continuation']['next_step']['reason'])
@@ -160,6 +178,15 @@ class StudioIntegration(unittest.TestCase):
 
     def test_validation_recovery_changes_plan_without_unnecessary_context_rotation(self):
         self.run_controller('native',autonomous=True,recover_validation=True)
+
+    def test_json_invalid_large_new_file_recovers_without_executing_rejected_source(self):
+        self.run_controller('json',autonomous=True,large_creation='invalid')
+
+    def test_json_output_limited_new_file_recovers_without_partial_execution(self):
+        self.run_controller('json',autonomous=True,large_creation='length')
+
+    def test_native_output_limit_preserves_the_working_tool_protocol(self):
+        self.run_controller('native',autonomous=True,large_creation='length')
 
 
 if __name__ == '__main__':

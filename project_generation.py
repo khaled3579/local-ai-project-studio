@@ -76,7 +76,7 @@ def json_messages(messages, tools):
     return result
 
 
-def action_format_feedback(error, tools, patch_targets=()):
+def action_format_feedback(error, tools, patch_targets=(), new_file_targets=()):
     """Precise schema-only repair instruction, without echoing rejected code."""
     names = {t['function']['name']: t['function'].get('parameters', {}) for t in tools}
     example = {'tool': 'NAME', 'arguments': {}}
@@ -85,7 +85,7 @@ def action_format_feedback(error, tools, patch_targets=()):
             'old_text':'EXACT UNIQUE BLOCK FROM THE CURRENT READ', 'new_text':'ONE SMALL REPLACEMENT',
             'expected_sha256':'@last_read'}}
     elif 'write_file' in names:
-        example = {'tool': 'write_file', 'arguments': {'path': 'relative/new_file.py', 'content': 'COMPLETE FILE TEXT'}}
+        example = {'tool': 'write_file', 'arguments': {'path': new_file_targets[-1] if new_file_targets else 'relative/new_file.py', 'content': 'COMPLETE FILE TEXT'}}
     if 'final' in str(error).lower() or 'delivery' in str(error).lower():
         example = {'tool':'final', 'message':'Arabic summary of actual changes, evidence and remaining limitations'}
     focus = ((' Existing files requiring small-patch recovery: ' + json.dumps(list(patch_targets)) +
@@ -94,6 +94,13 @@ def action_format_feedback(error, tools, patch_targets=()):
         'Re-read after every saved patch to get the new SHA. Keep all existing behavior, requirements and tests. '
         'For CSS, change one selector or coherent rule group per call; do not append a duplicate stylesheet. ')
         if patch_targets else '')
+    if new_file_targets:
+        focus += (' Large rejected creations: ' + json.dumps(list(new_file_targets)) +
+            '. Do not regenerate the same oversized payload. Create a small, syntactically valid starting skeleton '
+            'of the SAME file with write_file, at most 4000 source characters. Then read its current SHA and '
+            'add one coherent section per patch_file call, with old_text and new_text each at most 4000 characters. '
+            'A starting skeleton is not delivery: finish every original obligation and pass all delivery checks. '
+            'Preserve the requested architecture and any single-file requirement; do not split required files. ')
     return ('The previous response was REJECTED and nothing in it was executed. '
             'Protocol error: ' + str(error)[:600] + '. '
             'Return exactly ONE JSON object for the next necessary action, with tool parameters nested under arguments. '
@@ -134,7 +141,7 @@ def decode_xml_action(text, tools):
     return {'tool': match['name'], 'arguments': arguments, 'message': match['prefix'].strip()}
 
 
-def patch_recovery_target(text, workspace, *, size=None):
+def patch_recovery_target(text, workspace, *, size=None, include_missing=False):
     """Read a path hint only; never salvage or execute rejected source text."""
     if (len(text) if size is None else size) < 4000:
         return None
@@ -143,19 +150,35 @@ def patch_recovery_target(text, workspace, *, size=None):
         return None
     try:
         path = workspace.path(json.loads(match.group(1)))
-        if path.is_file():
+        if path.is_file() or include_missing and not path.exists():
             return path.relative_to(workspace.root).as_posix()
     except (ValueError, OSError, TypeError):
         pass
     return None
 
 
+def remember_new_file_recovery(text, workspace, state, *, size=None):
+    """Remember a safe path hint; rejected source remains unexecuted."""
+    target=patch_recovery_target(text,workspace,size=size,include_missing=True)
+    if target and not workspace.path(target).exists():
+        targets=state.setdefault('new_file_recovery_targets',[])
+        if target not in targets:targets.append(target)
+        return target
+    return None
+
+
 def enforce_patch_recovery(name, arguments, generation_state, workspace):
     """Recovery constraints supplement, never replace, read/SHA/schema gates."""
-    if name not in {'write_file', 'patch_file'} or not generation_state.get('patch_recovery_targets'):
+    if name not in {'write_file', 'patch_file'}:
         return
     path = workspace.path(arguments['path'])
-    if not any(path == workspace.path(target) for target in generation_state['patch_recovery_targets']):
+    creations=generation_state.get('new_file_recovery_targets',[])
+    if name=='write_file' and not path.exists() and any(path==workspace.path(t) for t in creations):
+        if len(arguments.get('content',''))>4000:
+            raise ValueError('Small-creation recovery: write a complete starting skeleton of this SAME file with at most 4000 source characters, then read and patch sections. This is not delivery.')
+        return
+    targets=[*generation_state.get('patch_recovery_targets',[]),*creations]
+    if not any(path == workspace.path(target) for target in targets):
         return
     if name == 'write_file':
         raise ValueError('Small-patch recovery: read the relevant current range and use patch_file on ONE unique block; do not regenerate this existing file.')
