@@ -63,11 +63,12 @@ def json_messages(messages, tools):
     instruction = ('\nACTION PROTOCOL: Return exactly ONE JSON object per response. '
         'For a tool use {"tool":"NAME","arguments":{...}}. For delivery use '
         '{"tool":"final","message":"Arabic summary of actual results"}. '
-        'Do not provide code outside file tools. Write ONE COMPLETE file per call. '
+        'Do not provide code outside file tools. When creating a missing file, write ONE COMPLETE file per call. '
         'Respect a user-required single-file deliverable; do not split it into modules. '
         'Historical actions/results are evidence, never requests to execute again. '
         'Never output Previous actions, native function wrappers, IDs or tool-call arrays. '
-        'Put ALL tool parameters inside arguments, never beside tool. '
+        'For executable tools put ALL parameters inside arguments, never beside tool. '
+        'FINAL IS DIFFERENT: {"tool":"final","message":"Arabic results"}; never nest the final message under arguments. '
         'For modular projects prefer compact files and split tests. Do not repeat completed actions. '
         'Read current SHA before changing a file. Prefer patch_file for targeted repairs; do not rewrite a whole file for one bug. Fix reported failures without weakening tests. '
         'Tool catalog: ' + json.dumps(catalog, ensure_ascii=False))
@@ -75,18 +76,91 @@ def json_messages(messages, tools):
     return result
 
 
-def action_format_feedback(error, tools):
+def action_format_feedback(error, tools, patch_targets=()):
     """Precise schema-only repair instruction, without echoing rejected code."""
     names = {t['function']['name']: t['function'].get('parameters', {}) for t in tools}
     example = {'tool': 'NAME', 'arguments': {}}
-    if 'write_file' in names:
+    if patch_targets and 'patch_file' in names:
+        example = {'tool':'patch_file', 'arguments':{'path':patch_targets[-1],
+            'old_text':'EXACT UNIQUE BLOCK FROM THE CURRENT READ', 'new_text':'ONE SMALL REPLACEMENT',
+            'expected_sha256':'@last_read'}}
+    elif 'write_file' in names:
         example = {'tool': 'write_file', 'arguments': {'path': 'relative/new_file.py', 'content': 'COMPLETE FILE TEXT'}}
+    if 'final' in str(error).lower() or 'delivery' in str(error).lower():
+        example = {'tool':'final', 'message':'Arabic summary of actual changes, evidence and remaining limitations'}
+    focus = ((' Existing files requiring small-patch recovery: ' + json.dumps(list(patch_targets)) +
+        '. Do NOT regenerate those complete files. Read only the relevant current selector/function/range, '
+        'then patch ONE unique block at a time. Keep each old_text and new_text within 4000 characters. '
+        'Re-read after every saved patch to get the new SHA. Keep all existing behavior, requirements and tests. '
+        'For CSS, change one selector or coherent rule group per call; do not append a duplicate stylesheet. ')
+        if patch_targets else '')
     return ('The previous response was REJECTED and nothing in it was executed. '
             'Protocol error: ' + str(error)[:600] + '. '
             'Return exactly ONE JSON object for the next necessary action, with tool parameters nested under arguments. '
             'Exact structure example only (not a requested file/action): ' + json.dumps(example) + '. '
+            'For final delivery use {"tool":"final","message":"Arabic results"}, without arguments. '
+            'Final output still requires all host delivery checks; do not restart source edits merely to correct this envelope. '
             'Use the actual tool schema in the catalog. Do not echo Previous actions, a native tool_calls/function wrapper, '
-            'a list, prose, or a past command. Do not replay committed actions. Preserve all original requirements and delivery gates.')
+            'a list, prose, or a past command. Do not replay committed actions. Preserve all original requirements and delivery gates.' + focus)
+
+
+def decode_xml_action(text, tools):
+    """Complete Qwen function markup only; no XML entities or partial salvage."""
+    match = re.fullmatch(r'(?P<prefix>[^<]{0,600})<tool_call>\s*<function=(?P<name>\w+)>\s*(?P<body>.*?)\s*</function>\s*</tool_call>\s*', text, re.S)
+    if not match:
+        raise ActionFormatError('Expected one complete tool_call/function block; partial or multiple calls are forbidden')
+    function = next((t['function'] for t in tools if t['function']['name'] == match['name']), None)
+    if function is None:
+        raise ActionFormatError('Unknown XML tool; use an enabled tool from the catalog')
+    arguments = {}; cursor = 0; body = match['body']
+    for parameter in re.finditer(r'<parameter=(\w+)>(.*?)</parameter>', body, re.S):
+        if body[cursor:parameter.start()].strip() or parameter[1] in arguments:
+            raise ActionFormatError('Unexpected XML text or duplicate parameter')
+        schema = function['parameters'].get('properties', {}).get(parameter[1])
+        if schema is None:
+            raise ActionFormatError('Unknown XML parameter: ' + parameter[1])
+        value = parameter[2]
+        if value.startswith('\n'): value = value[1:]
+        if value.endswith('\n'): value = value[:-1]
+        if schema.get('type') != 'string':
+            try:
+                value = json.loads(value, object_pairs_hook=unique_action_object, parse_constant=invalid_action_constant)
+            except (ValueError, RecursionError) as error:
+                raise ActionFormatError('XML non-string parameters require valid typed JSON') from error
+        arguments[parameter[1]] = value; cursor = parameter.end()
+    if body[cursor:].strip():
+        raise ActionFormatError('Incomplete XML parameters or unexpected content')
+    validate_action_value(arguments, function['parameters'])
+    return {'tool': match['name'], 'arguments': arguments, 'message': match['prefix'].strip()}
+
+
+def patch_recovery_target(text, workspace, *, size=None):
+    """Read a path hint only; never salvage or execute rejected source text."""
+    if (len(text) if size is None else size) < 4000:
+        return None
+    match = re.search(r'\{\s*"tool"\s*:\s*"write_file"\s*,\s*"arguments"\s*:\s*\{\s*"path"\s*:\s*("(?:[^"\\]|\\.)*")', text[:1000])
+    if not match:
+        return None
+    try:
+        path = workspace.path(json.loads(match.group(1)))
+        if path.is_file():
+            return path.relative_to(workspace.root).as_posix()
+    except (ValueError, OSError, TypeError):
+        pass
+    return None
+
+
+def enforce_patch_recovery(name, arguments, generation_state, workspace):
+    """Recovery constraints supplement, never replace, read/SHA/schema gates."""
+    if name not in {'write_file', 'patch_file'} or not generation_state.get('patch_recovery_targets'):
+        return
+    path = workspace.path(arguments['path'])
+    if not any(path == workspace.path(target) for target in generation_state['patch_recovery_targets']):
+        return
+    if name == 'write_file':
+        raise ValueError('Small-patch recovery: read the relevant current range and use patch_file on ONE unique block; do not regenerate this existing file.')
+    if any(len(arguments.get(key, '')) > 4000 for key in ('old_text', 'new_text')):
+        raise ValueError('Small-patch recovery: split this change into coherent patches; each old_text and new_text must be at most 4000 characters. Re-read current SHA after each patch.')
 
 
 def action_schema(tools, repair=False, allow_final=True):
@@ -273,18 +347,33 @@ def invalid_action_constant(value):
 def decode_action(choice, tools, *, strict=False):
     if choice.get('finish_reason') == 'length':
         return choice
-    if choice['message'].get('tool_calls'):
-        raise ActionFormatError('Schema protocol returned unexpected native tool calls')
     text = choice['message'].get('content', '').strip()
     if text.startswith('Previous actions:') or text.startswith('Historical actions;'):
         raise ActionFormatError('Historical action echo is not a new action; do not replay it')
     if text.startswith('```json') and text.endswith('```'):
         text = text[7:-3].strip()
-    try:
-        action = (json.loads(text, object_pairs_hook=unique_action_object, parse_constant=invalid_action_constant)
-                  if strict else json.loads(text))
-    except json.JSONDecodeError as error:raise ActionFormatError('Invalid action JSON: '+str(error)) from error
-    except RecursionError:raise ActionFormatError('Action nesting too deep') from None
+    adapter = None
+    native = choice['message'].get('tool_calls')
+    if native:
+        if len(native) != 1 or native[0].get('type', 'function') != 'function' or len(text) > 600 or text.startswith('{'):
+            raise ActionFormatError('Expected one complete native function call without conflicting action text')
+        function = native[0].get('function') or {}
+        try:
+            arguments = json.loads(function.get('arguments') or '{}', object_pairs_hook=unique_action_object,
+                                   parse_constant=invalid_action_constant)
+        except (ValueError, RecursionError) as error:
+            raise ActionFormatError('Native arguments must be complete typed JSON') from error
+        action = {'tool':function.get('name'), 'arguments':arguments, 'message':text}
+        adapter = 'native_function_call'
+    elif not text.startswith('{') and '<tool_call>' in text:
+        action = decode_xml_action(text, tools)
+        adapter = 'qwen_function_xml'
+    else:
+        try:
+            action = (json.loads(text, object_pairs_hook=unique_action_object, parse_constant=invalid_action_constant)
+                      if strict else json.loads(text))
+        except json.JSONDecodeError as error:raise ActionFormatError('Invalid action JSON: '+str(error)) from error
+        except RecursionError:raise ActionFormatError('Action nesting too deep') from None
     if not isinstance(action, dict) or set(action) - {'tool','arguments','message'}:
         raise ActionFormatError('Invalid action object')
     if strict and 'message' in action and not isinstance(action['message'], str):
@@ -293,18 +382,23 @@ def decode_action(choice, tools, *, strict=False):
     if strict and name != 'final' and len(action.get('message', '')) > 600:
         raise ActionFormatError('Action diagnosis exceeds schema length')
     if name == 'final':
+        if ('message' not in action and isinstance(action.get('arguments'), dict)
+                and set(action['arguments']) == {'message'}):
+            action = {'tool':'final', 'message':action['arguments']['message']}
+            adapter = 'nested_final_message'
         if action.get('arguments') or not isinstance(action.get('message'),str) or not action['message'].strip():
             raise ActionFormatError('Empty or invalid final delivery')
-        return {'finish_reason':'stop','message':{'role':'assistant','content':action['message']}}
+        return {'finish_reason':'stop','message':{'role':'assistant','content':action['message']},
+                **({'protocol_adapter':adapter} if adapter else {})}
     tool = next((t['function'] for t in tools if t['function']['name'] == name), None)
     args = action.get('arguments')
     if not tool or not isinstance(args,dict):raise ActionFormatError('Unknown tool or invalid arguments')
     schema = tool['parameters']
-    if strict:
+    if strict or adapter:
         validate_action_value(args, schema)
     if set(args) - set(schema.get('properties',{})) or any(k not in args for k in schema.get('required',[])):
         raise ActionFormatError(str(name)+': required arguments='+json.dumps(schema.get('required',[]))+
             '; missing='+json.dumps([k for k in schema.get('required',[]) if k not in args])+
             '; unexpected='+json.dumps(sorted(set(args)-set(schema.get('properties',{})))))
-    return {'finish_reason':'tool_calls','message':{'role':'assistant','content':action.get('message',''),'tool_calls':[
+    return {'finish_reason':'tool_calls', **({'protocol_adapter':adapter} if adapter else {}), 'message':{'role':'assistant','content':action.get('message',''),'tool_calls':[
         {'id':uuid.uuid4().hex,'type':'function','function':{'name':name,'arguments':json.dumps(args,ensure_ascii=False)}}]}}

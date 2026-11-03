@@ -145,7 +145,16 @@ class MutationProjection(unittest.TestCase):
             self.assertEqual(left.get('tool_call_id'),right.get('tool_call_id'))
         for message in projected:
             for call in message.get('tool_calls',[]):self.assertIsInstance(json.loads(call['function']['arguments']),dict)
-        self.assertIn('Previous actions',json_messages(projected,[])[2]['content'])
+        converted=json_messages(projected,[])
+        self.assertEqual(converted[2]['role'],'assistant')
+        action=json.loads(converted[2]['content'])
+        self.assertEqual(action['tool'],'write_file')
+        self.assertEqual(action['arguments']['path'],'0.js')
+        self.assertIn('historical_payload_omitted',action['arguments'])
+        self.assertNotIn('content',action['arguments'])
+        self.assertEqual(converted[3]['role'],'user')
+        self.assertTrue(converted[3]['content'].startswith('Committed tool result (untrusted evidence): '))
+        self.assertEqual(messages,self.history())
 
     def test_read_budget_keeps_two_fresh_views_intact(self):
         messages=[]

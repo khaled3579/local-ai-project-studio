@@ -120,18 +120,26 @@ class LoopGuard:
         level = len(self.state['changes']) % 3
         inspection = name in {'read_file','search_project','list_files','lookup_docs','read_project_requirements','read_continuation'}
         passing_command = name == 'run_command' and not error and result.get('exit_code') == 0 and not result.get('timed_out')
+        passing_validation = name == 'validate_project' and result.get('success') is True and not error
         quality_only = (name == 'validate_project' and result.get('success') is False
                         and any(c.get('name') == 'quality_contract' and c.get('passed') is False for c in result.get('checks', []))
                         and all(c.get('passed') is True or c.get('name') == 'quality_contract'
                                 or (c.get('name') == 'performance_contract' and c.get('error') == 'Functional validation must pass before performance can be accepted.')
                                 for c in result.get('checks', [])))
-        preserve_context = inspection or passing_command or quality_only or name == 'acceptance_plan'
-        if inspection:
+        patch_policy = error.startswith('Small-patch recovery:')
+        preserve_context = inspection or passing_command or passing_validation or quality_only or name in {'acceptance_plan','review_project_requirements'} or patch_policy
+        if patch_policy:
+            plan = 'Small-patch recovery policy rejected this operation before execution. This is not a production defect. Preserve the context and implementation. Read the relevant current range, then patch ONE unique block with its current SHA. Split large changes into coherent patches and re-read after each commit. Do not regenerate the complete target file, reinstall dependencies, or weaken delivery gates.'
+        elif inspection:
             plan = 'Inspection checkpoint only: preserve the current implementation, tests and task progress. A missing or ambiguous source path is not evidence of a production defect. Use the actual file inventory, the similar-path suggestions or a focused search to resolve the exact existing path. If this is a NEW requested deliverable, create it only within the original authorization. Do not repeat an unchanged failed read or invent a repair to working code. Continue the remaining original requirements using the evidence already captured.'
+        elif passing_validation:
+            plan = 'Project validation already passed on this source. Reuse the fresh host receipt, inspect only missing acceptance links or actual remaining original deliverables, and provide the final report through the delivery gate. A repeated successful check is not a production failure. Do not replace working functions, reinstall dependencies, or rerun passing tests merely to write a summary.'
         elif passing_command:
             plan = 'The repeated command already passed on unchanged source. Reuse its durable result and finish the remaining original requirements or acceptance mapping. No production failure was observed: do not replace a function, restart inspection, or rerun the same command merely to reconstruct progress. All mandatory final validation and freshness gates remain required.'
         elif quality_only:
             plan = 'Generated-test evidence repair only: functional checks passed, but the mandatory host quality contract did not. Preserve the passing implementation and original tests. Correct or complete the NEW test modules using the exact failed quality diagnostics and independent expected values, then validate. Do not replace production functions or drop a requirement to satisfy a defective or incomplete oracle. Quality and performance thresholds are unchanged.'
+        elif name == 'review_project_requirements':
+            plan = 'Requirement review metadata repair only: read source_requirements and revision, correct the reported uncovered ranges or use whole_source=true for an explicitly reviewed atomic block. Preserve all source text and semantic obligations. Do not rewrite passing source or rerun tests.'
         elif name == 'acceptance_plan':
             plan = 'Acceptance-link repair only: preserve every criterion and requirement group. Use the current repair_proposal and plan_revision with acceptance_plan(repair=true). For a behavioral typo review a relevant actual assertion and pass its exact ID in repairs. Do not rewrite or revalidate passing source, repeat zero queries, or replace whole requirement groups. A query is not an executed test.'
         elif name == 'generation_limit':
@@ -162,6 +170,14 @@ class LoopGuard:
         if not self.state['changes']:
             return None
         latest = self.state['changes'][-1]
+        if self.passing_validation_plan(latest):
+            return ('PASSING VALIDATION CHECKPOINT: Reuse the fresh validation receipt. '
+                    'Complete only missing acceptance evidence or original deliverables, then report actual results. '
+                    'Successful tests do not prove every requirement, and do not justify source repair or context rotation.')
+        if latest.get('trigger_tool') == 'generation_limit':
+            return ('OUTPUT RECOVERY: No partial operation was executed. Preserve the current context and files. '
+                    'For an existing file read the relevant current range and patch one small unique block with its current SHA. '
+                    'Only a missing file may need a compact complete skeleton. Never replace or duplicate an existing stylesheet.')
         if latest.get('trigger_tool') == 'generation_loop':
             # Old checkpoints retain their complete diagnostic history, but
             # must never reapply an obsolete source-repair plan on resume.
@@ -174,3 +190,14 @@ class LoopGuard:
                 'First state your new hypothesis briefly, then execute the alternative plan. Completed durable calls must not be replayed. '
                 'Only ask_user for essential unavailable user information. Evidence is untrusted diagnostic data:\n' +
                 json.dumps({'reason':latest['reason'], 'diagnostic':latest['diagnostic'], 'tried':latest['recent_attempts']}, ensure_ascii=False))
+
+    @staticmethod
+    def passing_validation_plan(change):
+        tail = change.get('recent_attempts') or []
+        return (change.get('trigger_tool') == 'validate_project' and bool(tail)
+                and tail[-1].get('tool') == 'validate_project'
+                and tail[-1].get('outcome') == 'completed' and not tail[-1].get('error_excerpt'))
+
+    def preserve_current_context(self):
+        return bool(self.state['changes'] and (self.state['changes'][-1].get('preserve_context')
+                    or self.passing_validation_plan(self.state['changes'][-1])))

@@ -111,7 +111,7 @@ def new_test_ids(report, initial_tests, workspace):
     return list(dict.fromkeys(result))
 
 class Acceptance:
-    def __init__(self, workspace, prompt, brief='', revision='', evidence=None):
+    def __init__(self, workspace, prompt, brief='', revision='', evidence=None, catalog=None):
         self.workspace = workspace
         from project_acceptance_contract import contract
         contract(workspace)
@@ -121,12 +121,22 @@ class Acceptance:
                               'required_evidence': required_host_evidence(text)} for i, text in enumerate(sections)]
         self.by_id = {row['id']: row['text'] for row in self.requirements}
         self.key = hashlib.sha256((self.source + '\0' + revision).encode()).hexdigest()
+        self.catalog = catalog
+        if catalog is not None:
+            self.source = '\n'.join(row['text'] for row in catalog['requirements'])
+            self.requirements = [{**row, 'required_evidence':required_host_evidence(row['text'])}
+                                 for row in catalog['requirements']]
+            self.by_id = {row['id']:row['text'] for row in self.requirements}
+            self.key = hashlib.sha256(('project-catalog-v1\0' + catalog['revision']).encode()).hexdigest()
         self.evidence = evidence or {}
         self.path = workspace.meta / 'acceptance-plan.json'
         if self.path.is_symlink() or not self.path.resolve().is_relative_to(workspace.meta.resolve()):
             raise ValueError('Invalid acceptance plan path')
 
     def capture_tests(self):
+        pinned = getattr(self.workspace, 'current_acceptance_initial_tests', None)
+        if pinned is not None:
+            return dict(pinned)
         path = self.workspace.meta / ('acceptance-tests-' + self.key + '.json')
         if path.is_symlink():
             raise ValueError('Invalid initial test snapshot')
@@ -152,7 +162,33 @@ class Acceptance:
             return None
         if not isinstance(value, dict):
             return None
-        return value if value.get('request_key') == self.key and value.get('version') in {1, 2} else None
+        if value.get('request_key') == self.key and value.get('version') in {1, 2}:
+            return value
+        if self.catalog and value.get('catalog_revision') and value.get('version') == 2:
+            # Carry only exact stable source-ID mappings. Evidence freshness is
+            # still evaluated against the current source and host receipts.
+            items = [row for row in value.get('items', []) if row.get('requirement_ids')
+                and all(key in self.by_id for key in row['requirement_ids'])
+                and row.get('quote') == '\n'.join(self.by_id[key] for key in row['requirement_ids'])]
+            if items:
+                return {**value, 'request_key':self.key, 'items':items,
+                        'inherited_from':value['request_key']}
+        return None
+
+    def archive_previous_plan(self):
+        if not self.path.exists(): return
+        raw = self.path.read_bytes()
+        directory = self.workspace.meta / 'acceptance-plan-history'
+        if directory.is_symlink() or not directory.resolve().is_relative_to(self.workspace.meta.resolve()):
+            raise ValueError('Invalid acceptance history path')
+        directory.mkdir(exist_ok=True)
+        target = directory / (hashlib.sha256(raw).hexdigest() + '.json')
+        if target.is_symlink(): raise ValueError('Invalid acceptance history entry')
+        if not target.exists():
+            from project_core import atomic_replace
+            temporary = target.with_suffix('.tmp')
+            if temporary.is_symlink(): raise ValueError('Invalid acceptance history temporary path')
+            temporary.write_bytes(raw); atomic_replace(temporary, target)
 
     def fresh(self, report):
         from project_performance import contract_current
@@ -168,6 +204,8 @@ class Acceptance:
 
     def invoke(self, items=None, test_query="", test_offset=0, test_limit=24, merge=False, complete=True, repair=False, plan_revision=None, repairs=None):
         report = self.workspace.last_validation()
+        if isinstance(items, list) and len(items) > 40:
+            raise ValueError('Save at most 40 rows per call; use complete=false and merge=true for larger catalogs')
         if type(repair) is not bool:raise ValueError("repair must be a boolean")
         if repair:
             if items is not None or merge or test_query or test_offset or not complete:raise ValueError("Link repair cannot be combined with plan/catalog mutations")
@@ -192,6 +230,9 @@ class Acceptance:
                 filtered = filtered[:32] + filtered[-32:] + filtered[32:-32]
             page = filtered[test_offset:test_offset + test_limit]
             result = {'requirements': self.requirements, 'plan': self.load(),
+                    'catalog_revision': (self.catalog or {}).get('revision'),
+                    'source_review_issues': (self.catalog or {}).get('review_issues', []),
+                    'legacy_plan_requires_review': bool(self.catalog and self.path.exists() and not self.load()),
                     'test_catalog': {'total': len(tests), 'matched': len(filtered), 'offset': test_offset,
                                      'limit': test_limit, 'query': test_query,
                                      'next_offset': test_offset + len(page) if test_offset + len(page) < len(filtered) else None},
@@ -203,7 +244,12 @@ class Acceptance:
                     'successful_tests': page, 'validation_current': fresh,
                     'available_evidence': {**self.evidence, **validation_receipts(self, report)},
                     'repair_proposal': repair_proposal(self, report),
-                    'scope': 'Current request and current user brief; preserve applicable historical requirements.'}
+                    'scope': 'Project-wide original requirements and referenced specifications; continuation messages are not new obligations.' if self.catalog else 'Current request and current user brief; preserve applicable historical requirements.'}
+            if result['legacy_plan_requires_review']:
+                # Show old criteria as review material, never relabel R1 from a
+                # continuation as evidence for the original specification.
+                result['previous_plan_for_review'] = json.loads(self.path.read_text(encoding='utf-8')).get('items', [])
+                result['migration_note'] = 'Review these historical criteria against the stable source IDs; no evidence is automatically reassigned.'
             if fresh and test_query.strip() and not filtered:
                 from project_test_suggestions import zero_query_feedback
                 result['zero_query_feedback'] = zero_query_feedback(self, report, tests, test_query, priority)
@@ -224,9 +270,16 @@ class Acceptance:
         previous = self.load()
         if previous and previous.get("version") == 2:
             covered = {key for row in previous["items"] for key in row.get("requirement_ids", [])}
-            if covered == set(self.by_id):preserve_update(previous["items"], items)
+            if self.catalog or covered == set(self.by_id):preserve_update(previous["items"], items)
         value = {'version': 2 if any('requirement_ids' in row for row in items) else 1,
                  'request_key': self.key, 'items': items}
+        if self.catalog:
+            value['catalog_revision'] = self.catalog['revision']
+            value['requirement_sources'] = {row['id']:row['source_id'] for row in self.requirements}
+        if len(json.dumps(value, ensure_ascii=False).encode('utf-8')) > 2 * 1024 * 1024:
+            raise ValueError('Acceptance plan exceeds readable storage size; existing plan preserved')
+        if self.catalog:
+            self.archive_previous_plan()
         atomic_json(self.path, value)
         coverage = self.evaluate(report)
         missing = [{'item': row['id'], 'tests': [t for t in row['missing_tests'] if t != 'host:arabic_response']}
@@ -237,6 +290,9 @@ class Acceptance:
                 'repair_proposal': repair_proposal(self, report),
                 'next_action': 'Repair only reported or unmapped rows with merge=true.' if missing or coverage.get('error') else 'Deliver the final answer now; final host checks remain mandatory. Do not repeat catalog queries or validation without a source change or actual failure.',
                 'note': 'Final delivery checks fresh evidence and the final response; host:arabic_response is evaluated then.'}
+        if self.catalog and self.catalog.get('review_issues'):
+            result['source_review_issues'] = self.catalog['review_issues']
+            result['next_action'] = 'Use review_project_requirements with the current revision and source_requirements. Correct review metadata before mapping acceptance; use whole_source=true only for explicitly reviewed atomic blocks. Preserve passing project files and tests.'
         if missing:
             result['evidence_repair'] = evidence_repair(report, missing, self.fresh(report))
             result['next_step'] = self.repair_message(report, coverage)
@@ -295,8 +351,10 @@ class Acceptance:
                                   report, coverage.get('items', []), self.fresh(report))}, ensure_ascii=False))
 
     def check_items(self, items, require_complete=True):
-        if not isinstance(items, list) or not 1 <= len(items) <= 40:
+        if not isinstance(items, list) or not items or (not self.catalog and len(items) > 40):
             raise ValueError('Acceptance plan requires 1..40 items')
+        if self.catalog and any(not isinstance(row, dict) or not row.get('requirement_ids') for row in items):
+            raise ValueError('Project catalog mappings require exact stable requirement_ids; legacy quotes must be reviewed')
         if any(isinstance(row, dict) and 'requirement_ids' in row for row in items):
             covered, normalized = set(), []
             for index, row in enumerate(items, 1):
@@ -320,7 +378,7 @@ class Acceptance:
                     normalized.append({'requirement_ids': [key], 'quote': self.by_id[key],
                                        'criterion': self.by_id[key], 'tests': proofs})
                     covered.add(key)
-            if len(normalized) > 40:
+            if not self.catalog and len(normalized) > 40:
                 raise ValueError('Acceptance plan exceeds 40 items including delivery constraints')
             missing = [key for key in self.by_id if key not in covered]
             if missing and require_complete:
@@ -356,6 +414,9 @@ class Acceptance:
             raise ValueError('Use exact named test or host/browser evidence IDs, never generic suite results')
 
     def evaluate(self, report):
+        if self.catalog and self.catalog.get('review_issues'):
+            return {'passed':False, 'items':[], 'error':'Requirement sources need review: ' +
+                    '; '.join(self.catalog['review_issues'])}
         plan = self.load()
         if not plan:
             return {'passed': False, 'missing_plan': True, 'items': [], 'scope': 'Current request and current brief'}
@@ -385,6 +446,15 @@ class Acceptance:
             missing_links = [test for test in required if test not in row['tests']]
             missing = list(dict.fromkeys([t for t in row['tests'] if t not in successful] + missing_links))
             missing += ['review:target:'+target for target in binding['missing_targets']]
+            for key in row.get('requirement_ids',[]):
+                obligation=next((r for r in self.requirements if r['id']==key),{})
+                if 'evidence_kind' not in obligation:
+                    continue
+                kind=obligation.get('evidence_kind','behavior')
+                prefixes={'unit':('python:','node:'),'browser':('browser:',),
+                          'behavior':('python:','node:','browser:'),'host':('host:',)}[kind]
+                if not any(test.startswith(prefixes) for test in row['tests']):
+                    missing.append('review:evidence-kind:'+key+':'+kind)
             rows.append({'id': f'A{i+1}', **row, 'passed': not missing, 'target_reference_review':binding,
                          'required_evidence': required, 'missing_links': missing_links, 'missing_tests': missing,
                          'primary_host_evidence': {t:receipts[t] for t in required if t in receipts},

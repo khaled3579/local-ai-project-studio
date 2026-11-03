@@ -3,7 +3,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, MagicMock, patch
 
 from project_core import Workspace
 from project_generation import request_body
@@ -133,11 +133,15 @@ class DurableMetrics(unittest.TestCase):
 class ExactToolCounting(unittest.TestCase):
     def test_token_count_uses_selected_catalog_not_global_catalog(self):
         import project_studio
-        template = Mock()
+        template = MagicMock()
+        template.status_code = 200
+        template.__enter__.return_value = template
         template.json.return_value = {'prompt': 'rendered'}
-        tokenize = Mock()
+        tokenize = MagicMock()
+        tokenize.status_code = 200
+        tokenize.__enter__.return_value = tokenize
         tokenize.json.return_value = {'tokens': [1, 2, 3]}
-        with patch.object(project_studio.requests, 'post', side_effect=[template, tokenize]) as post:
+        with patch.object(project_studio.requests.Session, 'post', side_effect=[template, tokenize]) as post:
             count = project_studio.token_count([{'role': 'user', 'content': 'hi'}], [])
         self.assertEqual(count, 3)
         self.assertEqual(post.call_args_list[0].kwargs['json']['tools'], [])

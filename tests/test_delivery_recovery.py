@@ -45,7 +45,8 @@ class LedgerRegression(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.ws = Workspace(Path(self.temp.name))
         self.recovery = Recovery(self.ws)
-        self.state = {'run_id': 'run', 'job': {'id': 'job', 'token_usage': {'requests': 2}},
+        self.state = {'run_id': 'run', 'fingerprint': self.ws.fingerprint(force=True),
+                      'job': {'id': 'job', 'token_usage': {'requests': 2}},
                       'agent_state': {'read_receipts': {'file.py': 'sha'},
                                       'read_coverage': {'file.py': {'sha256': 'sha', 'complete': False, 'spans': [[0, 10]]}}}}
 

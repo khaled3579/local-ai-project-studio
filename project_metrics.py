@@ -39,6 +39,11 @@ def record_generation(job, workspace, measurement, request_id, *, step, protocol
     receipt = {**measurement, 'id': request_id, 'job_id': job['id'], 'step': step,
                'protocol': protocol, 'estimated_input_tokens': estimated_input, 'time': time.time()}
     job['last_inference'] = receipt
+    try:
+        from project_progress import generation_outcome
+        generation_outcome(job,measurement)
+    except (KeyError,TypeError,ValueError) as error:
+        job['metrics_warning']='Progress accounting: '+str(error)
     target = workspace.meta / 'inference.jsonl'
     try:
         if not target.resolve().is_relative_to(workspace.meta.resolve()) or target.is_symlink():

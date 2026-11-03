@@ -9,6 +9,7 @@ from project_core import atomic_replace
 
 class Requirements:
     def __init__(self, workspace):
+        self.workspace = workspace
         self.path = workspace.meta / 'requirements.json'
         if self.path.is_symlink() or not self.path.resolve().is_relative_to(workspace.meta.resolve()):
             raise ValueError('مسار ذاكرة المتطلبات غير صالح')
@@ -31,11 +32,22 @@ class Requirements:
             os.fsync(file.fileno())
         atomic_replace(temporary, self.path)
 
-    def record(self, text, session_id, message_id):
+    def record(self, text, session_id, message_id, attachments=None):
         value = self.load()
         if not any(r['id'] == message_id for r in value['requests']):
-            value['requests'].append({'id':message_id, 'session_id':session_id, 'time':time.time(), 'order':len(value['requests']), 'text':text})
+            from project_requirement_lifecycle import classify
+            value['requests'].append({'id':message_id, 'session_id':session_id, 'time':time.time(),
+                'order':len(value['requests']), 'text':text, 'kind':classify(text),
+                'attachments':attachments or []})
             self.save(value)
+
+    def catalog(self, sessions=None, *, persist=True):
+        from project_requirement_catalog import build
+        return build(self.workspace, self.load(), sessions, persist=persist)
+
+    def review(self, **arguments):
+        from project_requirement_lifecycle import review
+        return review(self, **arguments)
 
     def edit(self, brief, revision):
         if not isinstance(brief, str) or len(brief) > 12000:
@@ -45,18 +57,21 @@ class Requirements:
             raise ValueError('تغيرت ذاكرة المشروع؛ أعد فتحها قبل الحفظ')
         value.setdefault('revisions', []).append({'time':time.time(), 'brief':value['brief']})
         value['brief'] = brief
+        value['brief_updated_at'] = time.time()
         self.save(value)
         return self.view()
 
     def view(self):
         value = self.load()
-        return {'brief':value['brief'], 'revision':self.revision(value), 'count':len(value['requests'])}
+        return {'brief':value['brief'], 'revision':self.revision(value), 'count':len(value['requests']),
+                'acceptance_scope':'project-wide original requests and referenced specifications; continuation is control only'}
 
     def read(self, offset=0, max_chars=8000):
         if type(offset) is not int or offset < 0 or type(max_chars) is not int or not 1 <= max_chars <= 12000:
             raise ValueError('نطاق قراءة المتطلبات غير صالح')
         value = self.load()
-        text = json.dumps({'brief':value['brief'], 'requests':value['requests']}, ensure_ascii=False, indent=2)
+        text = json.dumps({'brief':value['brief'], 'requests':value['requests'],
+                           'acceptance_catalog':self.catalog(persist=False)}, ensure_ascii=False, indent=2)
         return {'content':text[offset:offset+max_chars], 'more':offset+max_chars < len(text), 'next_offset':min(offset+max_chars,len(text)), 'total':len(text)}
 
     def prompt(self):
@@ -66,6 +81,9 @@ class Requirements:
         # Keep earliest requirements plus recent changes, without copying entire chats.
         chosen, used = [], 0
         for row in [*value['requests'][:3], *reversed(value['requests'][3:])]:
+            from project_requirement_lifecycle import classify
+            if classify(row['text']) in {'resume','question'}:
+                continue
             excerpt = row['text'][:3000]
             if used + len(excerpt) > 10000:
                 continue

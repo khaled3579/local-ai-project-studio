@@ -11,6 +11,12 @@ class RecoveryReview(Exception):
 
 
 class Recovery:
+    @staticmethod
+    def receipt_fingerprint(state, name):
+        if name=='run_command' and state.get('execution_context'):
+            return hashlib.sha256(json.dumps([state['fingerprint'],state['execution_context']]).encode()).hexdigest()
+        return state['fingerprint']
+
     def __init__(self, workspace):
         self.root = workspace.meta / 'recovery'
         self.root.mkdir(exist_ok=True)
@@ -90,10 +96,15 @@ class Recovery:
             # receipts. Never reuse validation/browser/acceptance evidence or
             # process lifecycle operations from a different call.
             if name in {'write_file', 'patch_file', 'run_command'}:
+                if name=='run_command':
+                    legacy=db.execute('SELECT 1 FROM execution_receipts WHERE run_id=? AND name=? AND arguments=? AND fingerprint=?',
+                        (state['run_id'],name,args,state['fingerprint'])).fetchone()
+                    if legacy:
+                        raise RecoveryReview('نتيجة أمر تاريخية بلا هوية بيئة تنفيذ؛ راجعها قبل إنشاء أمر بديل، ولن يعاد تلقائياً')
                 previous = db.execute('SELECT c.* FROM execution_receipts r JOIN calls c ON '
                     'c.run_id=r.run_id AND c.job_id=r.job_id AND c.call_id=r.call_id '
                     'WHERE r.run_id=? AND r.name=? AND r.arguments=? AND r.fingerprint=?',
-                    (state['run_id'], name, args, state['fingerprint'])).fetchone()
+                    (state['run_id'], name, args, self.receipt_fingerprint(state,name))).fetchone()
                 if previous and previous['status'] == 'completed':
                     value = json.loads(previous['result'])
                     value = {**value, 'reused_execution': True,
@@ -128,7 +139,7 @@ class Recovery:
                     and ((row['name'] in {'write_file', 'patch_file'} and result.get('saved') and result.get('sha256'))
                          or (row['name'] == 'run_command' and result.get('exit_code') == 0))):
                 db.execute('INSERT OR REPLACE INTO execution_receipts VALUES(?,?,?,?,?,?)',
-                    (state['run_id'], row['name'], row['arguments'], state['fingerprint'], state['job']['id'], call_id))
+                    (state['run_id'], row['name'], row['arguments'], self.receipt_fingerprint(state,row['name']), state['job']['id'], call_id))
             self._save(db, state)
 
     def calls(self, run_id):

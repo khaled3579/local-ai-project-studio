@@ -25,7 +25,7 @@ def binary_hash(path, size, modified):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
-def protocol_identity(policy):
+def protocol_identity(policy, *, include_loaded=True):
     active = policy.get('active') or {}
     if active.get('engine') == 'tabbyapi':
         from model_tabby import identity
@@ -46,6 +46,10 @@ def protocol_identity(policy):
     material = {'version': 1, 'model': stamp(model), 'template': template,
                 'template_override': active.get('chat_template'), 'engine': engine,
                 'thinking': values.get('thinking', 'auto'), 'effort': values.get('reasoning_effort', 'default')}
+    if include_loaded and policy.get('engine_identity'):
+        # Optional engines (e.g. Clover) have their own binary and template.
+        # Do not share their protocol cache with the default runtime identity.
+        material['loaded_engine'] = policy['engine_identity']
     return hashlib.sha256(json.dumps(material, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
@@ -94,11 +98,17 @@ def select_protocol(state, policy):
     old = state.get('tool_compatibility') or {}
     same = old.get('identity') == identity
     legacy = old.get('identity') == [str((policy.get('active') or {}).get('model', '')), policy.get('pid')]
+    previous_identity = protocol_identity(policy, include_loaded=False) if policy.get('engine_identity') else None
+    legacy = legacy or bool(previous_identity and old.get('identity') == previous_identity)
     warnings = []
     profile = {}
     try:
         with LOCK:
-            profile = read_profiles()['profiles'].get(identity) or {}
+            profiles = read_profiles()['profiles']
+            profile = profiles.get(identity) or {}
+            if not profile and previous_identity and profiles.get(previous_identity, {}).get('mode') == 'text':
+                # Preserve an observed grammar rejection during identity upgrade.
+                profile = profiles[previous_identity]
         if profile.get('mode') not in {'auto', 'text', None}:
             raise ValueError('Invalid saved tool protocol mode; no profile applied')
         if legacy and old.get('mode') in {'auto', 'text'}:

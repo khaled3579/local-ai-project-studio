@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 import project_studio
 from project_toolhub import hub
 from test_inference_metrics import Response
+from scripted_model import scripted_transport, review_fixture
 
 
 class BrowserAcceptanceIntegration(unittest.TestCase):
@@ -34,13 +35,16 @@ class BrowserAcceptanceIntegration(unittest.TestCase):
             studio.select(str(root))
             (studio.workspace.meta/'repair-settings.json').write_text('{"autonomous_repair":false}')
             prompt = 'Verify the counter with Node tests and an actual browser click.'
+            studio.requirements().record(prompt, studio.session_id, 'fixture-request')
+            review_fixture(studio.requirements())
+            requirement_ids = [row['id'] for row in studio.requirements().catalog()['requirements']]
             studio.job = {'id':'browser-integration', 'status':'running', 'mode':'project', 'original_prompt':prompt,
                           'prompt':prompt, 'started':1, 'verified':False}
             studio.repair_run = {'id':'browser-run', 'status':'running', 'attempt_index':1}
             actions = [('validate_project', {}), ('browser_project', {'action':'open','entry':'index.html'}),
                        ('browser_project', {'action':'click','selector':'#increment'}),
                        ('browser_project', {'action':'assert','selector':'#count','expected':'1'}),
-                       ('acceptance_plan', {'items':[{'requirement_ids':['R1'], 'criterion':'Counter increments once with real browser confirmation',
+                       ('acceptance_plan', {'items':[{'requirement_ids':requirement_ids, 'criterion':'Counter increments once with real browser confirmation',
                                                     'tests':['node:counter increments','@browser']}]}), (None,{})]
             sent = []
 
@@ -69,9 +73,8 @@ class BrowserAcceptanceIntegration(unittest.TestCase):
                                    {'choices':[],'usage':{'prompt_tokens':100,'completion_tokens':20}},'[DONE]'])
                 response.status_code=200;return response
 
-            manager=Mock();manager.json.return_value={'actual_context':32768,'active':{'model':'gemma4-unit' if protocol=='json' else 'qwen-unit'}}
             try:
-                with patch.object(project_studio.requests,'post',side_effect=post), patch.object(project_studio.requests,'get',return_value=manager):
+                with scripted_transport(folder, protocol, post):
                     studio.agent_attempt(prompt)
                 self.assertEqual(studio.job['status'],'complete',studio.job)
                 self.assertTrue(studio.job['verified'])

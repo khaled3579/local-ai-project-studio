@@ -29,7 +29,7 @@ class ReleasePackage(unittest.TestCase):
             build(root, archive, '4.5.0')
             with zipfile.ZipFile(archive) as package:
                 names = set(package.namelist())
-                for name in ('Start.cmd', 'Stop.cmd', 'Start-All.ps1', 'Stop-All.ps1', 'README_START_AR.txt', 'project_file_context.py', 'project_source_index.py', 'project_source_index.js'):
+                for name in ('Start.cmd', 'Stop.cmd', 'Start-All.ps1', 'Stop-All.ps1', 'README_START_AR.txt', 'service_bootstrap.py', 'project_file_context.py', 'project_source_index.py', 'project_source_index.js'):
                     self.assertIn(name, names)
                 self.assertFalse(any(n.startswith(('daily/', '.local-ai/', 'tests/')) for n in names))
                 manifest = json.loads(package.read('APP-MANIFEST.json'))

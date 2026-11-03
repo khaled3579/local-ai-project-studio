@@ -79,6 +79,7 @@ def json_identity(identity):
 
 
 def relevance(owner,report,row):
+    report = report or {}
     from project_acceptance_bindings import host_only_row
     named=[name for name in row['tests'] if name.startswith(('node:','python:'))]
     if host_only_row(owner,row) or not named and any(name.startswith('browser:') for name in row['tests']):

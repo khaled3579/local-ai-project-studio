@@ -1,4 +1,4 @@
-حزمة Local AI Project Studio — الإصدار 4.14.3
+حزمة Local AI Project Studio — الإصدار 4.16.0
 
 التشغيل اليومي:
 فك ZIP في مجلد مستقل قابل للكتابة ثم شغّل Daily-Projects.cmd. يلزم Python 3.13 x64 مثبت على Windows. الاعتمادات الثمانية مرفقة كعجلات بإصدارات وبصمات SHA-256 مقفلة، وتُثبت دون شبكة داخل .environments. يتضمن runtime محرك llama وNode الرسمي. لا تتضمن الحزمة أوزان النماذج أو Python نفسه أو تعريف NVIDIA وCUDA؛ يفحص Doctor.ps1 متطلبات الجهاز.
