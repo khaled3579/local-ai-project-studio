@@ -1998,6 +1998,8 @@ class Studio:
             job['auto_validation_fingerprint'] = workspace.fingerprint()
             fresh_ids = new_test_ids(automatic_report, generation_state.get('acceptance_initial_tests', {}), workspace) if automatic_report.get('success') else []
             receipt_hint = (' Fresh successful new test IDs (use directly in acceptance_plan): ' + json.dumps(fresh_ids[:24], ensure_ascii=False)) if fresh_ids else ''
+            from project_validation_guidance import passing_context
+            receipt_hint += passing_context(workspace,automatic_report,self.requirements().catalog(self.sessions)) if automatic_report.get('success') else ''
             messages.append({'role':'user', 'content': 'Automatic validation after your edit: ' + repair_focus(workspace,automatic_report,prompt) + receipt_hint +
                 (' Validation passed. Finish the remaining original requirements and deliver concisely.' if automatic_report.get('success') else ' Repair the actual failure now, preserving all meaningful tests and requirements. Do not reread unrelated files, restart the task or stop for user confirmation.')})
             self.autosave(prompt, attachment_ids, state_for(step + 1))

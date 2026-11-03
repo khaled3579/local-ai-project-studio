@@ -7,13 +7,15 @@ const path = require('node:path');
 function load() {
   const nodes = new Map();
   class Element {
-    constructor() { this.children = []; this.textContent = ''; }
+    constructor() { this.children = []; this.textContent = ''; this.dataset = {}; }
     set id(value) { this._id = value; nodes.set(value, this); }
     get id() { return this._id; }
     setAttribute() {}
     insertAdjacentElement() {}
     remove() {}
     append(...children) { this.children.push(...children); }
+    querySelectorAll() { return []; }
+    replaceChildren(...children) { this.children = [...children]; }
   }
   const get = id => { if (!nodes.has(id)) { const item = new Element(); item.id = id; } return nodes.get(id); };
   let context;
@@ -25,6 +27,12 @@ function load() {
     fetch: () => new Promise(() => {}), // No network or reconnect timers in this unit test.
     AbortController, console,
   });
+  // The live extension shares this real classifier with the main page.
+  // Load it from the shipped HTML rather than substituting its behavior.
+  const html = fs.readFileSync(path.join(__dirname, '..', 'project_studio.html'), 'utf8');
+  const classifier = html.match(/^function isOperationMessage\(m\).*$/m);
+  assert.ok(classifier, 'main-page operation classifier must be present');
+  vm.runInContext(classifier[0], context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'project_live_client.js'), 'utf8'), context);
   return {context, get};
 }
