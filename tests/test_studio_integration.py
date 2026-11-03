@@ -15,7 +15,7 @@ from scripted_model import scripted_transport, review_fixture
 
 
 class StudioIntegration(unittest.TestCase):
-    def run_controller(self, protocol, unsafe_write=False, premature_final=False, autonomous=False, review_in_agent=False, repeat_read=False, recover_validation=False, large_creation=None):
+    def run_controller(self, protocol, unsafe_write=False, premature_final=False, autonomous=False, review_in_agent=False, repeat_read=False, recover_validation=False, large_creation=None, bad_review=False):
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)
             root = directory / 'project'
@@ -54,6 +54,10 @@ class StudioIntegration(unittest.TestCase):
                         {'start':0,'end':boundary,'evidence_kind':'behavior'},
                         {'start':boundary,'end':len(block['text']),'evidence_kind':'behavior'}]}]}))
             sent = []
+            if bad_review:
+                current=studio.requirements().catalog();source=current['source_requirements'][0]
+                actions.insert(0,('review_project_requirements',{'expected_revision':current['revision'],'items':[{
+                    'requirement_id':source['id'],'reviewed_atomic':True,'whole_source':True,'evidence_kind':'context'}]}))
             if large_creation:
                 actions[:0]=[('write_file',{'path':'database.py','content':'VALUE = 0\n'+'# padding\n'*600}),
                              ('write_file',{'path':'database.py','content':'VALUE = 1\n'})]
@@ -109,7 +113,12 @@ class StudioIntegration(unittest.TestCase):
             self.assertIn('return a + b', (root / 'app.py').read_text(encoding='utf-8'))
             self.assertIn('UNRELATED = 42', (root / 'app.py').read_text(encoding='utf-8'))
             self.assertTrue(json.loads((studio.workspace.meta / 'delivery-evidence.json').read_text(encoding='utf-8'))['validated'])
-            self.assertEqual(len(studio.recovery().calls('integration-run')), (6 if premature_final else 5)+int(review_in_agent)+int(repeat_read)+3*int(recover_validation)+int(bool(large_creation)))
+            self.assertEqual(len(studio.recovery().calls('integration-run')), (6 if premature_final else 5)+int(review_in_agent)+int(repeat_read)+3*int(recover_validation)+int(bool(large_creation))+int(bad_review))
+            if bad_review:
+                rejected=[json.loads(c['result']) for c in studio.recovery().calls('integration-run') if json.loads(c['result']).get('review_repair')]
+                self.assertEqual(len(rejected),1)
+                self.assertFalse(rejected[0]['review_repair']['batch_saved'])
+                self.assertIn('offset_scope',json.dumps(sent[1]))
             if large_creation:
                 self.assertEqual((root/'database.py').read_text(),'VALUE = 1\n')
                 self.assertIn('starting skeleton',json.dumps(sent[1],ensure_ascii=False))
@@ -187,6 +196,9 @@ class StudioIntegration(unittest.TestCase):
 
     def test_native_output_limit_preserves_the_working_tool_protocol(self):
         self.run_controller('native',autonomous=True,large_creation='length')
+
+    def test_review_failure_guidance_is_durable_and_visible_without_source_repair(self):
+        self.run_controller('native',autonomous=True,review_in_agent=True,bad_review=True)
 
 
 if __name__ == '__main__':

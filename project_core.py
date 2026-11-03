@@ -79,7 +79,7 @@ TOOLS = [
     tool("write_file", "Create or update a complete file inside the selected project. Existing files require reading first, then expected_sha256='@last_read' (the controller supplies the exact observed hash and still rejects stale edits). Parent folders are created. Save code with this tool.", {"path": STRING, "content": STRING, "expected_sha256": STRING}, ["path", "content"]),
     tool('patch_file', "Repair an existing file with ONE exact text replacement instead of rewriting it. Read current file first, then use expected_sha256='@last_read'. old_text must occur exactly once. Python syntax is checked before committing; failed patches do not change the file. Prefer this for small fixes.", {'path':STRING,'old_text':STRING,'new_text':STRING,'expected_sha256':STRING}, ['path','old_text','new_text','expected_sha256']),
     tool("run_command", "Execute a noninteractive project command with its cwd set to the project. Python uses the project .venv. Use for diagnostics/tests, not persistent GUI apps. Use an argv array, not a shell expression.", {"argv": {"type": "array", "items": STRING}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 120}}, ["argv"]),
-    tool("validate_project", "Validate every detected Python and JavaScript layer together. Python unittest and native node:test require fresh execution receipts with actual passes; skipped-only tests and a successful npm exit are not passes. Unsupported test runners fail explicitly. Preserve existing tests and frameworks; never remove a language or weaken tests to satisfy validation. Writes a versioned report required before delivery."),
+    tool("validate_project", "Validate every detected Python and JavaScript layer together using actual execution receipts. Reuses an already passing receipt only for identical source, validator, contracts and execution environment in this task. Repair acceptance metadata without repeating passing tests. For changed external test inputs or an intentional repeated run use force=true with a concrete reason. Skipped tests and npm exit alone are not passes; preserve all meaningful tests.", {'force':{'type':'boolean'},'reason':{'type':'string'}}),
     tool("run_project", "Run a Python, JavaScript or HTML project entry file after successful validation. HTML starts a loopback preview and returns its URL. Only use when the user asks to run the application. GUI/long-running apps run in background and have a Stop button. For a short CLI example prefer run_command.", {"entry": STRING, "args": {"type": "array", "items": STRING}, "background": {"type": "boolean"}}, ["entry"]),
 ]
 from project_toolhub import schemas as assistant_schemas, NAMES as ASSISTANT_NAMES, hub as assistant_hub
@@ -310,7 +310,9 @@ class Workspace:
         atomic_replace(temporary, destination)
 
     @locked
-    def validate(self):
+    def validate(self,force=False,reason=None):
+        if type(force) is not bool or force and (not isinstance(reason,str) or len(reason.strip())<10):
+            raise ValueError('Forced repeated validation needs a concrete reason of at least 10 characters')
         start_fingerprint = self.fingerprint(force=True)
         files = self.files()
         # A new failed/interrupted check must not leave a previous green report usable.

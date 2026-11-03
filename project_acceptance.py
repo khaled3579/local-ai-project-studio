@@ -17,6 +17,25 @@ def file_digest(path):
     with path.open('rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
+
+def targeted_patch_clause(text):
+    clause=text.strip().rstrip('.;؛!?؟').strip().casefold()
+    return bool(re.fullmatch(r'(?:use|apply) (?:a )?targeted patch(?: to (?:change|fix|modify) the existing implementation)?|استخدم رقعة محددة لتعديل التنفيذ الحالي',clause))
+
+
+def targeted_patch_evidence(workspace,initial_tests,job):
+    proof={'passed':False,'files':[],'scope':'An existing non-test source has a host-recorded patch whose result matches current bytes. This is process evidence, not behavioral correctness.'}
+    from project_source_guard import baseline_current
+    pin=getattr(workspace,'source_guard_baseline',None)
+    if not pin or pin.get('id')!=job.get('base_version') or not baseline_current(workspace):return proof
+    baseline={r['path']:r for r in workspace.history.get(pin['id'])['files']}
+    for name,receipt in job.get('efficiency',{}).get('source_patch_receipts',{}).items():
+        if name not in baseline or name in initial_tests or '/tests/' in ('/'+name) or workspace.path(name).suffix.lower() not in {'.py','.pyw','.js','.mjs','.cjs','.ts','.tsx','.jsx','.html','.css'}:continue
+        path=workspace.path(name)
+        if path.is_file() and receipt.get('before_fingerprint')!=receipt.get('after_fingerprint') and receipt.get('sha256')!=baseline[name]['sha256'] and file_digest(path)==receipt.get('sha256'):
+            proof['files'].append(name)
+    proof['passed']=bool(proof['files']);return proof
+
 def required_host_evidence(text):
     """Recognize explicit delivery constraints only; not a semantic requirement parser."""
     parts = re.split(r'(?<=[.!?;؛؟])\s+|\n+', text)
@@ -24,6 +43,9 @@ def required_host_evidence(text):
         return list(dict.fromkeys(test for part in parts for test in required_host_evidence(part)))
     text = text.casefold()
     required = []
+    if targeted_patch_clause(text):required.append('host:targeted_source_patch')
+    from project_comment_evidence import clause as comment_clause
+    if comment_clause(text):required.append('host:source_comments_preserved')
     preserve = bool(re.search(r'\b(preserve|unchanged|unmodified)\b|do not (?:edit|modify|change)|لا (?:تعدل|تعدّل|تغير|تغيّر)|دون تعديل|الحفاظ على', text))
     if preserve and re.search(r'(?:preserve|do not (?:edit|modify|change))[^.;\n]{0,180}\btests?\b|\b(?:existing|original) tests?\b[^.;\n]{0,60}(?:unchanged|unmodified)|(?:الحفاظ على|دون تعديل|لا تعدّل|لا تعدل)[^.;\n]{0,100}الاختبارات', text):
         required.append('host:original_tests_unchanged')
@@ -56,7 +78,7 @@ def host_only_requirements(requirements, initial_tests=None):
     adapter = None
     for row in requirements:
         clause = row['text'].strip().rstrip('.;؛!?؟').strip().casefold()
-        if any(re.fullmatch(pattern, clause) for pattern in patterns):
+        if any(re.fullmatch(pattern, clause) for pattern in patterns) or targeted_patch_clause(row['text']) or __import__('project_comment_evidence').clause(row['text']):
             proof = required_host_evidence(row['text'])
         elif clause == 'preserve their exact bytes' and previous and all(
                 p in {'host:original_tests_unchanged', 'host:original_readmes_unchanged'} for p in previous):
@@ -245,6 +267,14 @@ class Acceptance:
                     'available_evidence': {**self.evidence, **validation_receipts(self, report)},
                     'repair_proposal': repair_proposal(self, report),
                     'scope': 'Project-wide original requirements and referenced specifications; continuation messages are not new obligations.' if self.catalog else 'Current request and current user brief; preserve applicable historical requirements.'}
+            if self.catalog and self.catalog.get('pending_obligation_reviews'):
+                pending=set(self.catalog['pending_obligation_reviews'])
+                sources=[r for r in self.catalog['source_requirements'] if r['id'] in pending][:16]
+                result['source_review']={'pending_count':len(pending),'shown':len(sources),
+                    'blocks':[{'requirement_id':r['id'],'text':r['text'][:2000],
+                        'text_truncated':len(r['text'])>2000,'source_length':len(r['text']),
+                        'supported_host_evidence':host_only_requirements([r]).get(r['id'],[])} for r in sources],
+                    'instructions':'Review these ORIGINAL requirement texts, not project-file spans. For a semantically reviewed atomic block use reviewed_atomic=true, whole_source=true and evidence_kind, with no segments. Split compound text with exact text fragments or source-relative ranges. Only actual structural headings can be context. Empty supported_host_evidence means use relevant unit/browser behavior assertions, not a guessed host receipt or unrelated test. After reviewing this batch, remaining unreviewed blocks still prevent delivery.'}
             if result['legacy_plan_requires_review']:
                 # Show old criteria as review material, never relabel R1 from a
                 # continuation as evidence for the original specification.
@@ -472,6 +502,7 @@ def host_evidence(workspace, initial_tests, job, final='', browser=None):
     changed_readmes = [name for name in changed if name.rsplit('/', 1)[-1].lower().startswith('readme')]
     changed_tests = [name for name in changed if name not in changed_readmes]
     result = {
+        'host:targeted_source_patch': targeted_patch_evidence(workspace,initial_tests,job),
         'host:original_tests_unchanged': {'passed': not changed_tests, 'changed': changed_tests},
         'host:original_readmes_unchanged': {'passed': not changed_readmes, 'changed': changed_readmes},
         'host:no_persistent_launch': {'passed': not job.get('run_entry') and workspace.running is None,
@@ -485,6 +516,9 @@ def host_evidence(workspace, initial_tests, job, final='', browser=None):
         'host:arabic_response': {'passed': len(re.findall('[\u0621-\u064a\u066e-\u06d3\u06fa-\u06fc]', final)) >= 5,
                                  'scope': 'Response contains Arabic text; does not prove linguistic quality'},
     }
+    if job.get('comment_preservation_required'):
+        from project_comment_evidence import evidence as comment_evidence
+        result['host:source_comments_preserved']=comment_evidence(workspace,job)
     for name, proof in (browser or {}).items():
         result[name] = {**proof, 'passed': bool(proof.get('passed') and proof.get('fingerprint') == fingerprint)}
     return result

@@ -14,6 +14,48 @@ KINDS = {'behavior', 'unit', 'browser', 'host', 'context'}
 ID_PATTERN = r'R_[a-f0-9]{24}_\d+(?:_[a-f0-9]{12})?'
 
 
+class ReviewError(ValueError):
+    def __init__(self,message,key,text,catalog):
+        super().__init__(message+' [source requirement '+key+']')
+        from project_acceptance import host_only_requirements
+        host=host_only_requirements([{'id':key,'text':text}]).get(key,[])
+        self.review_repair={'requirement_id':key,'source_text':text[:2000],
+            'source_text_truncated':len(text)>2000,'source_length':len(text),
+            'expected_revision':catalog['revision'],'batch_saved':False,
+            'offset_scope':'Positions in this original requirement text, never positions in a project file.',
+            'supported_host_evidence':host,
+            'atomic_example_after_explicit_review':{'requirement_id':key,'reviewed_atomic':True,
+                'whole_source':True,'evidence_kind':'host' if host else 'behavior'},
+            'next_action':'Correct this row, keeping the other correct rows unchanged; the rejected batch saved nothing. '
+                'Only after reviewing atomicity use the example, without segments or file offsets. '
+                'For compound text split into exact text fragments (occurrence is required when ambiguous), or source-relative spans. '
+                'A non-heading obligation must not be context. If supported_host_evidence is empty, review relevant behavioral/unit/browser assertions; do not substitute host-only or unrelated tests. '
+                'Preserve passing project code and validation. Do not rerun tests just to repair review metadata.'}
+
+
+def segment_bounds(text,segment):
+    if not isinstance(segment,dict):raise ValueError('Each obligation must be an object')
+    if 'text' not in segment:
+        if 'occurrence' in segment or 'start' not in segment or 'end' not in segment:
+            raise ValueError('Use exact text OR both source-relative start/end positions')
+        return segment['start'],segment['end']
+    if 'start' in segment or 'end' in segment:raise ValueError('Choose exact text or positions, never both')
+    fragment=segment['text']
+    if not isinstance(fragment,str) or not fragment.strip():raise ValueError('Exact obligation text must be nonempty')
+    matches=[];position=text.find(fragment)
+    while position>=0:
+        matches.append(position);position=text.find(fragment,position+1)
+    occurrence=segment.get('occurrence')
+    if not matches:raise ValueError('Exact fragment is absent from this requirement source')
+    if occurrence is None:
+        if len(matches)!=1:raise ValueError('Exact fragment is ambiguous; specify its one-based occurrence')
+        start=matches[0]
+    else:
+        if type(occurrence) is not int or not 1<=occurrence<=len(matches):raise ValueError('Invalid fragment occurrence')
+        start=matches[occurrence-1]
+    return start,start+len(fragment)
+
+
 def classify(text):
     value = plain(text).replace('أ','ا').replace('إ','ا').replace('آ','ا')
     if value in {plain(x) for x in ('أكمل','أكمل العمل','أكمل من حيث توقفت','استئناف السلسلة',
@@ -129,6 +171,55 @@ def apply(workspace, catalog, requests):
     return result
 
 
+def review_segments(key,text,item):
+    covered=set()
+    if item.get('whole_source') is True:
+        if 'segments' in item:
+            raise ValueError('Choose whole_source or segments, never both')
+        segments=[{'start':0,'end':len(text),'evidence_kind':item.get('evidence_kind')}]
+        if 'context_reason' in item:segments[0]['context_reason']=item['context_reason']
+    else:
+        if any(field in item for field in ('evidence_kind','context_reason')):
+            raise ValueError('Top-level evidence_kind requires whole_source=true')
+        segments=item.get('segments')
+    if not isinstance(segments,list) or not 1<=len(segments)<=128:
+        raise ValueError('Each source block requires 1 to 128 obligations')
+    cleaned=[]
+    for segment in segments:
+        start,end=segment_bounds(text,segment); kind=segment.get('evidence_kind')
+        if type(start) is not int or type(end) is not int or not 0<=start<end<=len(text) or kind not in KINDS:
+            raise ValueError('Invalid obligation span or evidence kind')
+        positions=set(range(start,end))
+        if covered & positions or not text[start:end].strip():
+            raise ValueError('Obligations cannot overlap or be empty')
+        if kind=='host':
+            from project_acceptance import host_only_requirements
+            if not host_only_requirements([{'id':key,'text':text[start:end]}]):
+                raise ValueError('Behavior cannot be replaced with host-only evidence')
+        if kind=='context':
+            snippet=text[start:end].strip()
+            structural=bool(re.fullmatch(r'(?:#{1,6}\s+[^\n]+|\*\*[^*\n]+\*\*:?)',snippet))
+            directive=re.search(r'\b(?:must|shall|required|implement|add|support|enable|يجب|يلزم|نفذ|اضف|دعم|انشاء)\b',plain(snippet))
+            reason=segment.get('context_reason','')
+            if not structural or directive or not isinstance(reason,str) or len(reason.strip())<20:
+                raise ValueError('Only explicitly reviewed structural headings may be context; preserve behavioral text as obligations')
+        covered.update(positions)
+        cleaned.append({'start':start,'end':end,'evidence_kind':kind})
+        if kind=='context':cleaned[-1]['context_reason']=reason.strip()
+    if any(i not in covered and not c.isspace() for i,c in enumerate(text)):
+        missing=[i for i,c in enumerate(text) if i not in covered and not c.isspace()]
+        ranges=[]
+        for i in missing:
+            if ranges and ranges[-1]['end']==i:ranges[-1]['end']=i+1
+            else:ranges.append({'start':i,'end':i+1})
+        for row in ranges:row['text']=text[row['start']:row['end']]
+        raise ValueError('Source text omitted; every non-whitespace character needs an obligation. '
+            +json.dumps({'requirement_id':key,'source_length':len(text),'uncovered':ranges,
+              'next_action':'Correct review_project_requirements arguments only. For a semantically reviewed atomic block use whole_source=true with evidence_kind and reviewed_atomic=true; compound blocks require complete segments. Do not rewrite project files or rerun passing tests.'},ensure_ascii=False))
+    cleaned.sort(key=lambda row:row['start'])
+    return cleaned
+
+
 def review(requirements, *, expected_revision, items):
     catalog=requirements.catalog(persist=False)
     if catalog['revision'] != expected_revision:
@@ -142,51 +233,11 @@ def review(requirements, *, expected_revision, items):
         key=item['requirement_id']
         if key in updates or key not in blocks or item.get('reviewed_atomic') is not True:
             raise ValueError('Use each exact source ID once and confirm atomicity review')
-        text=blocks[key]['text']; covered=set()
-        if item.get('whole_source') is True:
-            if 'segments' in item:
-                raise ValueError('Choose whole_source or segments, never both')
-            segments=[{'start':0,'end':len(text),'evidence_kind':item.get('evidence_kind')}]
-            if 'context_reason' in item:segments[0]['context_reason']=item['context_reason']
-        else:
-            if any(field in item for field in ('evidence_kind','context_reason')):
-                raise ValueError('Top-level evidence_kind requires whole_source=true')
-            segments=item.get('segments')
-        if not isinstance(segments,list) or not 1<=len(segments)<=128:
-            raise ValueError('Each source block requires 1 to 128 obligations')
-        cleaned=[]
-        for segment in segments:
-            start,end=segment['start'],segment['end']; kind=segment['evidence_kind']
-            if type(start) is not int or type(end) is not int or not 0<=start<end<=len(text) or kind not in KINDS:
-                raise ValueError('Invalid obligation span or evidence kind')
-            positions=set(range(start,end))
-            if covered & positions or not text[start:end].strip():
-                raise ValueError('Obligations cannot overlap or be empty')
-            if kind=='host':
-                from project_acceptance import host_only_requirements
-                if not host_only_requirements([{'id':key,'text':text[start:end]}]):
-                    raise ValueError('Behavior cannot be replaced with host-only evidence')
-            if kind=='context':
-                snippet=text[start:end].strip()
-                structural=bool(re.fullmatch(r'(?:#{1,6}\s+[^\n]+|\*\*[^*\n]+\*\*:?)',snippet))
-                directive=re.search(r'\b(?:must|shall|required|implement|add|support|enable|يجب|يلزم|نفذ|اضف|دعم|انشاء)\b',plain(snippet))
-                reason=segment.get('context_reason','')
-                if not structural or directive or not isinstance(reason,str) or len(reason.strip())<20:
-                    raise ValueError('Only explicitly reviewed structural headings may be context; preserve behavioral text as obligations')
-            covered.update(positions)
-            cleaned.append({'start':start,'end':end,'evidence_kind':kind})
-            if kind=='context':cleaned[-1]['context_reason']=reason.strip()
-        if any(i not in covered and not c.isspace() for i,c in enumerate(text)):
-            missing=[i for i,c in enumerate(text) if i not in covered and not c.isspace()]
-            ranges=[]
-            for i in missing:
-                if ranges and ranges[-1]['end']==i:ranges[-1]['end']=i+1
-                else:ranges.append({'start':i,'end':i+1})
-            for row in ranges:row['text']=text[row['start']:row['end']]
-            raise ValueError('Source text omitted; every non-whitespace character needs an obligation. '
-                +json.dumps({'requirement_id':key,'source_length':len(text),'uncovered':ranges,
-                  'next_action':'Correct review_project_requirements arguments only. For a semantically reviewed atomic block use whole_source=true with evidence_kind and reviewed_atomic=true; compound blocks require complete segments. Do not rewrite project files or rerun passing tests.'},ensure_ascii=False))
-        cleaned.sort(key=lambda row:row['start'])
+        text=blocks[key]['text']
+        try:
+            cleaned=review_segments(key,text,item)
+        except (ValueError,KeyError,TypeError) as error:
+            raise ReviewError(str(error),key,text,catalog) from error
         entry={'source_sha256':digest(text),'segments':cleaned,'time':now,
                'revision':digest([key,cleaned]),'reviewed_atomic':True}
         if key in ledger['reviews']:

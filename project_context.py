@@ -226,6 +226,22 @@ def diagnostic_excerpt(text, limit=2400):
 
 def tool_result_view(name, value):
     """Bound model-facing catalogs and retain failure diagnostics before metadata."""
+    if name=='review_project_requirements' and isinstance(value,dict) and value.get('review_repair'):
+        return {'error':str(value.get('error',''))[:1200],'review_repair':value['review_repair'],
+                'progress_hint':value.get('progress_hint')}
+    if name=='acceptance_plan' and isinstance(value,dict) and value.get('source_review'):
+        plan=value.get('plan') or {}
+        review={**value['source_review'],'blocks':[dict(r) for r in value['source_review']['blocks']]}
+        host={key for row in review['blocks'] for key in row.get('supported_host_evidence',[])}
+        view={'catalog_revision':value.get('catalog_revision'),'source_review':review,
+            'validation_current':value.get('validation_current'),'successful_tests':value.get('successful_tests',[])[:8],
+            'available_evidence':{k:{'passed':bool(v.get('passed'))} for k,v in value.get('available_evidence',{}).items() if k in host},
+            'existing_plan_retained':bool(plan),'plan_items':len(plan.get('items',[])),
+            'next_action':'Repair source review metadata first using the exact source_review block texts and catalog_revision. Preserve the current plan, code and passing validation. Read acceptance_plan again after review for full criteria and link repair; no requirement is removed by this bounded view.'}
+        while len(json.dumps(view,ensure_ascii=False))>10500 and len(review['blocks'])>1:
+            review['blocks'].pop()
+        review['shown']=len(review['blocks'])
+        return view
     if name == 'list_files' and isinstance(value, dict) and isinstance(value.get('files'), list) and not value.get('error'):
         # All paths remain visible. Per-file byte sizes are available in the
         # durable result and read_file; avoid JSON object overhead per path.

@@ -23,6 +23,7 @@ def tracker(job):
     state.setdefault('pending_recoveries',[state['pending_recovery']] if state.get('pending_recovery') else [])
     state.setdefault('recovery_failure_at',{})
     state.setdefault('repeat_without_progress_candidates',0)
+    state.setdefault('reused_validations',0)
     return state
 
 
@@ -90,6 +91,7 @@ def observe(job,name,arguments,result,before,after,*,epoch=0,browser_fingerprint
     if repeated:state['repeat_candidates']+=1
     if result.get('reused_read'):state['reused_reads']+=1
     if result.get('reused_execution'):state['reused_execution']+=1
+    if result.get('reused_validation'):state['reused_validations']+=1
     detail=result.get('result',result)
     failed=bool(result.get('error') or result.get('timed_out') or result.get('exit_code',0) not in (None,0)
                 or result.get('success') is False or result.get('missing_evidence')
@@ -97,6 +99,9 @@ def observe(job,name,arguments,result,before,after,*,epoch=0,browser_fingerprint
     progress=[];evidence=[]
     if before!=after:
         progress.append('source_changed')
+        if name=='patch_file' and result.get('saved') and isinstance(result.get('sha256'),str):
+            state.setdefault('source_patch_receipts',{})[result['saved']]={'sha256':result['sha256'],
+                'before_fingerprint':before,'after_fingerprint':after}
         state.setdefault('first_source_change_at',now)
         state['last_source_change']={'time':now,'fingerprint':after}
         # All old requirement completion needs re-evaluation on new source.
@@ -118,7 +123,7 @@ def observe(job,name,arguments,result,before,after,*,epoch=0,browser_fingerprint
         if key not in state['evidence_keys']:
             progress.append('accepted_mapping');state['evidence_keys'].append(key)
     if progress:state['progress_events']+=1
-    reused=bool(result.get('reused_execution') or result.get('reused_read'))
+    reused=bool(result.get('reused_execution') or result.get('reused_read') or result.get('reused_validation'))
     if repeated and not progress and not reused:state['repeat_without_progress_candidates']+=1
     if failed:
         failure(state,lane(name,result))
@@ -172,6 +177,7 @@ def metrics(job):
     all_measured=bool(totals.get('requests')) and totals.get('requests')==totals.get('measured_requests')
     request_count=totals.get('requests')
     return {'completed_requirements':completed,'repeat_candidates':state['repeat_candidates'],
+        'reused_validations':state['reused_validations'],
         'repeat_without_progress_candidates':state['repeat_without_progress_candidates'],
         'requests_per_completed_requirement':request_count/completed if completed and type(request_count) is int else None,
         'tokens_per_completed_requirement':(totals.get('prompt_tokens',0)+totals.get('completion_tokens',0))/completed if completed and all_measured else None,

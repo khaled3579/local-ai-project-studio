@@ -1479,6 +1479,9 @@ class Studio:
                     workspace.requirements_catalog_needs_review=True
                     return result
                 invoke = review_operation
+            elif name == 'validate_project':
+                from project_validation_reuse import validate as validation_with_reuse
+                invoke=lambda:validation_with_reuse(generation_state,workspace,arguments,workspace.validate,job.get('started'))
             elif name == 'read_continuation':
                 invoke = lambda: self.read_continuation(**arguments)
             elif name == 'read_attachment':
@@ -1817,8 +1820,8 @@ class Studio:
         with self.lock:
             job["phase"] = "الفحص الإلزامي قبل التسليم"
         def final_validation():
-            current = current_passing_validation(workspace, job.get('started', time.time()))
-            return {**current, 'reused_validation': True} if current is not None else workspace.validate()
+            from project_validation_reuse import validate as validate_current
+            return validate_current(generation_state,workspace,{},workspace.validate,job.get('started',time.time()))
         report = execute_durable(f'final-validation-v{VALIDATION_VERSION}-' + str(step), 'validate_project', {}, final_validation, step, pending_response)
         if 'error' in report:
             raise RuntimeError(report['error'])
@@ -1884,6 +1887,7 @@ class Studio:
         generation_state['requirements_catalog_revision'] = catalog['revision']
         workspace.current_acceptance_initial_tests = generation_state.get('acceptance_initial_tests')
         initial_acceptance = Acceptance(workspace, job.get('original_prompt', prompt), req['brief'], self.requirements().revision(req), catalog=catalog)
+        job['comment_preservation_required']=any('host:source_comments_preserved' in row['required_evidence'] for row in initial_acceptance.requirements)
         workspace.requirements_catalog_needs_review = initial_acceptance.load() is None or bool(catalog['review_issues'])
         generation_state.setdefault('acceptance_initial_tests', initial_acceptance.capture_tests())
         workspace.current_acceptance_initial_tests = generation_state['acceptance_initial_tests']
@@ -1986,7 +1990,10 @@ class Studio:
         has_tests = any('/tests/' in ('/' + f['path']) and f['path'].endswith(('.py', '.js', '.cjs', '.mjs')) for f in workspace.files())
         if not read_only and wrote and has_tests and self.repair_settings()['autonomous_repair'] and not run.get('user_question') and job.get('auto_validation_fingerprint') != workspace.fingerprint():
             job['phase'] = 'فحص آلي بعد التعديل؛ إصلاح النتائج تلقائيًا'
+            from project_validation_reuse import remember as remember_validation
+            validation_environment=progress.execution_context(workspace)
             automatic_report = execute_durable(f'auto-validation-v{VALIDATION_VERSION}-' + str(step), 'validate_project', {}, workspace.validate, step + 1)
+            remember_validation(generation_state,workspace,automatic_report,validation_environment)
             generation_state['repair'] = repair_phase(workspace,automatic_report,prompt)
             job['auto_validation_fingerprint'] = workspace.fingerprint()
             fresh_ids = new_test_ids(automatic_report, generation_state.get('acceptance_initial_tests', {}), workspace) if automatic_report.get('success') else []
@@ -2102,6 +2109,7 @@ class Studio:
                                                  len(run.get('context_transitions',[]))) if not read_only else invoke()
                 except Exception as error:
                     value = {'error': str(error)}
+                    if getattr(error,'review_repair',None):value['review_repair']=error.review_repair
                     self.event('tool_error', {'name': name, 'error': str(error)})
             finally:
                 workspace.process_observer = None

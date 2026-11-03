@@ -3,6 +3,9 @@ from project_acceptance import Acceptance,host_evidence
 
 def ready(studio,workspace,job,prompt,state):
     if state.get('finalization_repair_required'):return None
+    from project_progress import execution_context
+    receipt=state.get('validation_reuse_receipt')
+    if receipt and receipt.get('environment')!=execution_context(workspace):return None
     report=workspace.last_validation()
     catalog=studio.requirements().catalog(studio.sessions)
     proof=host_evidence(workspace,state.get('acceptance_initial_tests',{}),job,browser=state.get('acceptance_browser'))

@@ -30,6 +30,14 @@ class CompletionRouting(unittest.TestCase):
         (self.ws.root/'app.py').write_text('def counter(): return 2\n')
         self.assertIsNone(ready(self.studio,self.ws,self.job,'continue',self.state))
 
+    def test_execution_environment_change_reopens_tools_before_final_response(self):
+        from project_progress import execution_context
+        from unittest.mock import patch
+        self.state['validation_reuse_receipt']={'environment':execution_context(self.ws)}
+        self.assertIsNotNone(ready(self.studio,self.ws,self.job,'Add counter',self.state))
+        with patch.dict('os.environ',{'COMPLETION_FIXTURE':'different'}):
+            self.assertIsNone(ready(self.studio,self.ws,self.job,'Add counter',self.state))
+
     def test_missing_requirement_or_invalid_final_response_reopens_tools(self):
         self.state['finalization_repair_required']=True
         self.assertIsNone(ready(self.studio,self.ws,self.job,'Add counter',self.state))

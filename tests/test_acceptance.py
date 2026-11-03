@@ -53,6 +53,17 @@ class AcceptanceTests(unittest.TestCase):
         plan.invoke(rows)
         self.assertTrue(plan.evaluate(self.report())['passed'])
 
+    def test_comments_cannot_be_proved_by_unrelated_successful_unit_test(self):
+        self.ws._save_validation_report(self.report())
+        plan=Acceptance(self.ws,'Preserve the existing reference comments.',
+                        evidence={'host:source_comments_preserved':{'passed':False}})
+        plan.invoke([{'requirement_ids':['R1'],'criterion':'Original comments retained',
+                      'tests':['python:test_app.Tests.test_add']}])
+        self.assertIn('host:source_comments_preserved',plan.load()['items'][0]['tests'])
+        self.assertFalse(plan.evaluate(self.report())['passed'])
+        plan.evidence['host:source_comments_preserved']={'passed':True,'fingerprint':self.ws.fingerprint(force=True)}
+        self.assertTrue(plan.evaluate(self.report())['passed'])
+
     def test_failed_host_constraint_cannot_be_hidden_by_passing_unit_test(self):
         plan = Acceptance(self.ws, 'Preserve existing tests.', evidence={'host:original_tests_unchanged':{'passed':False}})
         plan.invoke([{'requirement_ids':['R1'],'criterion':'Existing tests unchanged',
