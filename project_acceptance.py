@@ -98,7 +98,7 @@ def host_only_requirements(requirements, initial_tests=None):
     return result
 
 ACCEPTANCE_TOOL = tool('acceptance_plan',
-    'Repair missing acceptance links without rewriting criteria: read the repair_proposal, then call repair=true with its plan_revision. Supply repairs=[{item_id,old_test,new_test}] only for behavioral IDs after reviewing the actual assertion. Explicit corrections take precedence over automatic suggestions for the same row/link. Executed old links are retained when adding fresh evidence; requesting an already linked ID is a no-op. Typed host obligations are repaired together only for whole host-only requirement clauses. Never remove prior criteria or requirement groups. '
+    'Read or edit acceptance criteria and requirement mappings. For existing rows with missing or invalid evidence, use link_acceptance_evidence. '
     'Read requirement IDs, exact source text, fresh successful test IDs and current plan (omit items). Large catalogs show first and last IDs together, then the middle on subsequent pages; filter with test_query and continue with test_offset/test_limit. '
     'Save behavior mappings using the exact requirement_ids already supplied in the system requirements. Use complete=false for a reviewed partial draft, then merge=true to add or repair only missing rows. Drafts never authorize delivery; complete fresh coverage is still required. Pure supported delivery constraints are added automatically with actual host checks; mixed or unknown clauses must be mapped explicitly. '
     'Each item states a concrete observable criterion and uses exact successful test IDs listed by the current validate_project result or this tool '
@@ -117,6 +117,30 @@ ACCEPTANCE_TOOL = tool('acceptance_plan',
                        'requirement_ids': {'type': 'array', 'minItems': 1, 'maxItems': 128, 'items': {'type': 'string'}}} |
                       {'tests': {'type': 'array', 'minItems': 1, 'maxItems': 30, 'items': {'type': 'string'}}},
         'required': ['requirement_ids', 'criterion', 'tests'], 'additionalProperties': False}}})
+
+LINK_EVIDENCE_TOOL = tool('link_acceptance_evidence',
+    'Link evidence to existing acceptance rows. Omit repairs to read a page of unresolved rows. '
+    'Copy the returned item_id and missing old_test, review the actual assertion, then supply its exact executed new_test. '
+    'Use repairs=[] to apply available typed host replacements. The host selects the current revision. '
+    'Use acceptance_plan only for criteria or requirement mapping changes.',
+    {'offset': {'type': 'integer', 'minimum': 0},
+     'repairs': ACCEPTANCE_TOOL['function']['parameters']['properties']['repairs']})
+
+
+def track_acceptance_attempt(state, before, after, query=None):
+    """Bound attempts across tool names and across changing rejected arguments."""
+    if state.get('snapshot') != before or before != after:
+        state.clear()
+        state.update(snapshot=after, mutations=0, queries={})
+    if before != after:
+        return False
+    if query is None:
+        state['mutations'] += 1
+        return state['mutations'] >= 8
+    queries = state['queries']
+    queries[query] = queries.get(query, 0) + 1
+    return queries[query] >= 4 or len(queries) >= 64
+
 
 def new_test_ids(report, initial_tests, workspace):
     """Prioritize actual receipts for newly added test files, without granting passes."""
@@ -224,14 +248,205 @@ class Acceptance:
                     and report.get('source_unchanged_during_validation') and not report.get('in_progress')
                     and report.get('fingerprint') == self.workspace.fingerprint(force=True))
 
-    def invoke(self, items=None, test_query="", test_offset=0, test_limit=24, merge=False, complete=True, repair=False, plan_revision=None, repairs=None):
+    def link_evidence(self, offset=0, repairs=None, *, stage_scope=None):
+        if type(offset) is not int or offset < 0:
+            raise ValueError('offset must be a non-negative integer')
+        report = self.workspace.last_validation()
+        plan = self.load()
+        current = repair_proposal(self, report)
+        rows = []
+        ids = {}
+        from project_acceptance_targets import observable_sources
+        for row in current['repairs']:
+            item_id = row['item_id']
+            criterion = plan['items'][int(item_id[1:]) - 1]
+            # WorkPlan.evidence gates the stage on every exact matching criterion,
+            # including historical rows whose requirement IDs belong elsewhere.
+            # Hiding those rows makes an unsatisfied gate impossible to repair.
+            # This exposes its existing links only; no requirement is reassigned.
+            if stage_scope and criterion['criterion'] not in stage_scope['criteria']:
+                continue
+            identity = [criterion['criterion'], criterion.get('requirement_ids', []), criterion.get('quote', '')]
+            key = item_id + ':' + hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode()).hexdigest()[:16]
+            ids[key] = item_id
+            rows.append({
+                'item_id': key, 'requirement_ids': row['requirement_ids'],
+                'criterion': row['criterion'][:500], 'missing_tests': row['missing_tests'],
+                'candidate_successful_tests': row['candidate_successful_tests'][:8],
+                'automatic_replacements': row['automatic_replacements'],
+                'missing_targets': row['target_reference_review'].get('missing_targets', []),
+                'observable_review': row['target_reference_review'].get('observable_review', {}),
+                'required_source_requirements': observable_sources(self.requirements, {'requirement_ids':row['requirement_ids'],'missing':row['target_reference_review'].get('observable_review',{}).get('missing',[])}),
+                'existing_links': criterion['tests'],
+                'repairable_existing_links': [link for link in criterion['tests'] if link in row['missing_tests']],
+                'existing_links_are_only_valid_old_test_values': True,
+                'add_evidence_guidance': 'First repair the exact repairable_existing_links when present; choosing a valid old link only appends evidence and leaves these defects unresolved. If no stored invalid link remains and an existing executed link is valid but insufficient, copy it as old_test and add the new relevant executed ID as new_test. The existing valid link is retained. Missing review:target markers are diagnostics, not old_test IDs. If no relevant candidate exists, implement a relevant test or browser scenario and obtain fresh evidence first.',
+                'next_action': ('Review a relevant executed assertion before linking.'
+                                if row['candidate_successful_tests'] or row['automatic_replacements']
+                                else 'Capture the missing named test or typed host/browser evidence.'),
+            })
+        # Ordering only: historical proofs never become current or accepted here.
+        # Prefer missing implementation/assertions before replaying stale scenarios
+        # which another source edit would immediately invalidate again.
+        deferred = 0
+        if self.fresh(report):
+            for entry in rows:
+                criterion = plan['items'][int(ids[entry['item_id']][1:]) - 1]
+                stale, supported = set(), set()
+                for name in criterion['tests']:
+                    proof = self.evidence.get(name, {})
+                    assertion = proof.get('assertion') or {}
+                    if (not name.startswith('browser:') or not (proof.get('passed') is True or proof.get('observed_passed') is True)
+                            or assertion.get('passed') is not True or proof.get('fingerprint') == report.get('fingerprint')):
+                        continue
+                    stale.add(name); supported.add('observable:ui-observation')
+                    interaction = assertion.get('interaction') or {}
+                    if (assertion.get('source') in {'text','value','checked','count','dialog_count','image_format'}
+                            and interaction.get('action') in {'click','fill','select','press','upload'} and interaction.get('state_changed') is True):
+                        supported.add('observable:ui-interaction')
+                        if interaction.get('mutation_observed') is True: supported.add('observable:persisted-mutation')
+                    image = assertion.get('image_format') or {}
+                    if (assertion.get('source') == 'image_format' and assertion.get('actual') == 'image/webp'
+                            and image.get('mime') == 'image/webp' and image.get('signature') == 'RIFF/WEBP'
+                            and image.get('decoded') is True and image.get('bytes',0) >= 20):
+                        supported.add('observable:webp-format')
+                        supported.add('observable:decoded-webp-output')
+                targets = set(entry['missing_targets'])
+                missing = set(entry['missing_tests'])
+                refresh_only = bool(stale and targets <= supported and missing
+                                    and all(name in stale or (name.startswith('review:target:') and name.removeprefix('review:target:') in supported) for name in missing))
+                entry['evidence_state'] = 'refresh_after_source_stable' if refresh_only else 'needs_evidence_or_implementation'
+                if refresh_only:
+                    deferred += 1
+                    entry['next_action'] = ('Historical linked browser evidence is stale, not accepted. Finish remaining implementation/test changes first, '
+                        'then validate stable source and refresh this exact relevant scenario once. Never reuse stale evidence for delivery.')
+            rows.sort(key=lambda entry: entry.get('evidence_state') == 'refresh_after_source_stable')
+        page = {'rows': rows[offset:offset + 3], 'total': len(rows),
+                'next_offset': offset + 3 if offset + 3 < len(rows) else None,
+                'validation_current': current['validation_current']}
+        # Host-issued browser IDs must be rediscoverable after conversation
+        # compaction. These are available proofs, not automatic row mappings.
+        browser_proofs = []
+        if self.fresh(report):
+            for name, proof in self.evidence.items():
+                if (not name.startswith('browser:') or proof.get('passed') is not True
+                        or proof.get('fingerprint') != report.get('fingerprint')):
+                    continue
+                assertion = proof.get('assertion') or {}
+                if assertion.get('passed') is not True:
+                    continue
+                interaction = assertion.get('interaction') or {}
+                browser_proofs.append({'evidence_id': name,
+                    'selector': str(assertion.get('selector', ''))[:240],
+                    'source': assertion.get('source'),
+                    'browser_context': proof.get('browser_context'),
+                    'image_format': assertion.get('image_format'),
+                    'expected': str(assertion.get('expected', ''))[:300],
+                    'actual': str(assertion.get('actual', ''))[:300],
+                    'action': interaction.get('action'),
+                    'state_changed': interaction.get('state_changed') is True,
+                    'mutation_observed': interaction.get('mutation_observed') is True,
+                    'scope': 'Current owned static preview assertion; not proof of backend persistence or encoded format by itself.'})
+        page.update(deferred_browser_refresh_count=deferred, actionable_evidence_count=len(rows)-deferred,
+                    ordering_note='Unimplemented or missing evidence first; stale historical browser scenarios last. All current validation and acceptance guards remain mandatory.')
+        page['current_browser_evidence'] = browser_proofs[offset:offset + 12]
+        page['browser_evidence_next_offset'] = offset + 12 if offset + 12 < len(browser_proofs) else None
+        page['browser_evidence_total'] = len(browser_proofs)
+        page['browser_evidence_note'] = ('Copy the exact evidence_id only after reviewing its assertion against the criterion. '
+            'report_id is a diagnostic report identifier, not an acceptance evidence ID. '
+            'Use offset=browser_evidence_next_offset for further available browser proofs. '
+            'No browser proof is automatically linked. Stale and failed assertions are excluded.')
+        status = self.mapping_status(report)
+        unmapped = status['unmapped_requirements']
+        if stage_scope:
+            page['stage_scope'] = {'stage_id':stage_scope['stage_id'],
+                'requirement_count':len(stage_scope['requirement_ids']),
+                'criterion_count':len(stage_scope['criteria']),
+                'global_unresolved_row_count':len(current['repairs']),
+                'global_unmapped_requirement_count':len(unmapped)}
+            unmapped = [row for row in unmapped if row['id'] in stage_scope['requirement_ids']]
+        page['unmapped_requirements'] = [
+            {'id': row['id'], 'text': row['text'][:600], 'text_truncated': len(row['text']) > 600}
+            for row in unmapped[:4]]
+        if self.catalog and self.catalog.get('review_issues'):
+            page.update(next_tool='review_project_requirements',
+                        next_action='Review the pending original source blocks before mapping or repairing links.')
+        elif rows:
+            page.update(next_tool='link_acceptance_evidence',
+                        next_action=('Finish the listed missing implementation/assertions before refreshing stale browser scenarios; validate stable source, then collect fresh evidence and link it.' if deferred and len(rows)>deferred else 'Refresh the listed historical browser scenarios on stable validated source, then link current evidence; stale proofs remain invalid.' if deferred else 'Review the listed executed assertions, then submit repairs with these current item_id values.'))
+        elif unmapped:
+            page.update(next_tool='acceptance_plan',
+                        next_action='These requirements have no criterion yet. Save reviewed criteria with their exact IDs and relevant evidence; complete=false, merge=true.')
+        elif stage_scope:
+            page.update(next_tool='project_plan',
+                        next_action='No unresolved link or unmapped requirement is listed in this stage scope. Continue the preserved project plan; this is NOT whole-project completion. All original requirements and global fresh delivery checks remain mandatory.')
+        elif status['ready_for_final_response']:
+            page.update(next_tool=None, next_action='Return the final answer. Host delivery checks still apply.')
+        else:
+            page.update(next_tool='validate_project' if not current['validation_current'] else None,
+                        next_action='Obtain fresh successful validation before linking evidence.' if not current['validation_current']
+                        else 'Inspect the acceptance error before delivery.', error=status.get('error'))
+        from project_evidence_repair import route_evidence_page
+        page = route_evidence_page(page)
+        if repairs is None:
+            return page
+        if not isinstance(repairs, list) or len(repairs) > 40:
+            return {**page, 'error': 'Provide at most 40 explicit link corrections.'}
+        if stage_scope and not rows and repairs:
+            return {**page, 'saved':False, 'not_executed':True,
+                    'error':'No unresolved link targets exist in the current stage. Do not invent or reuse item IDs.',
+                    'next_tool':'project_plan',
+                    'next_call':{'action':'read', 'stage_id':stage_scope['stage_id']},
+                    'repair_feedback':{'batch_saved':False, 'current_item_ids':[],
+                        'next_action':'Read the preserved stage criteria and requirement coverage. Map missing criteria using acceptance_plan; do not resave resolved links. All criteria and final delivery checks remain unchanged.'}}
+        corrections = []
+        for repair in repairs:
+            if (not isinstance(repair, dict) or set(repair) != {'item_id', 'old_test', 'new_test'}
+                    or not all(isinstance(value, str) for value in repair.values())
+                    or repair['item_id'] not in ids):
+                return {**page, 'error': 'Copy the FULL current item_id including its colon/hash suffix. Supply only item_id, old_test and new_test.',
+                        'repair_feedback': {'batch_saved':False,'current_item_ids':list(ids),'received_item_id':repair.get('item_id') if isinstance(repair,dict) else None,'next_action':'Copy the exact opaque item_id from rows; A7 alone is not A7:hash. Use exact existing_links and current executed candidate/browser IDs. Do not invent node IDs.'}}
+            selected = plan['items'][int(ids[repair['item_id']][1:]) - 1]
+            if repair['old_test'] not in selected['tests']:
+                already_linked = repair['new_test'] in selected['tests']
+                if not already_linked:
+                    current_row = next(row for row in rows if row['item_id'] == repair['item_id'])
+                    return route_evidence_page({**page, 'rows': [current_row],
+                            'error': 'old_test must be an exact stored link. Empty strings and review:target diagnostics are not links.',
+                            'repair_feedback': {'item_id': repair['item_id'], 'field': 'old_test',
+                                'received_old_test': repair['old_test'], 'current_links': list(selected['tests']),
+                                'missing_tests': current_row['missing_tests'],
+                                'candidate_successful_tests': current_row['candidate_successful_tests'],
+                                'observable_review': current_row['observable_review'],
+                                'batch_saved': False,
+                                'next_action': 'Do not resend this correction. If adding relevant fresh evidence, use an exact current_links entry as old_test; valid links are retained. review:target entries describe missing assertions, not link IDs. If the asserted outcome has no relevant executed candidate, implement/capture that outcome first, then query this tool for fresh IDs. Never invent node:ui-observation or clear a diagnostic by name.'}})
+            current_row = next(row for row in rows if row['item_id'] == repair['item_id'])
+            invalid = current_row['repairable_existing_links']
+            if invalid and repair['old_test'] not in invalid and repair['new_test'] not in selected['tests']:
+                return {**page, 'rows':[current_row],
+                    'error':'Repair an invalid stored link first; adding beside a valid link leaves the listed defects unresolved.',
+                    'repair_feedback':{'batch_saved':False,'item_id':repair['item_id'],'repairable_existing_links':invalid,
+                        'next_action':'Use an exact listed invalid old_test and a relevant fresh executed new_test. Valid links and every criterion remain preserved. If no relevant replacement exists, implement/capture that outcome first.'}}
+            corrections.append({**repair, 'item_id': ids[repair['item_id']]})
+        try:
+            result = self.invoke(repair=True, plan_revision=current['plan_revision'], repairs=corrections)
+        except ValueError as error:
+            affected = {repair['item_id'] for repair in repairs}
+            return route_evidence_page({**page, 'rows': [row for row in rows if row['item_id'] in affected][:3] or page['rows'],
+                    'error': str(error)})
+        return {key: result[key] for key in ('saved', 'link_only_repair', 'changes', 'unchanged',
+                                              'validation_current', 'next_action')} | {
+            'mapping_status': {'ready_for_final_response': result['mapping_status']['ready_for_final_response']}}
+
+    def invoke(self, items=None, test_query="", test_offset=0, test_limit=24, merge=False, complete=True, repair=False, plan_revision=None, repairs=None, *, recover_revision=False):
         report = self.workspace.last_validation()
         if isinstance(items, list) and len(items) > 40:
             raise ValueError('Save at most 40 rows per call; use complete=false and merge=true for larger catalogs')
         if type(repair) is not bool:raise ValueError("repair must be a boolean")
         if repair:
             if items is not None or merge or test_query or test_offset or not complete:raise ValueError("Link repair cannot be combined with plan/catalog mutations")
-            return apply_link_repair(self, report, plan_revision, repairs if repairs is not None else [])
+            return apply_link_repair(self, report, plan_revision, repairs if repairs is not None else [],
+                                     recover_revision=recover_revision)
         if repairs is not None or plan_revision is not None:raise ValueError("repairs/plan_revision require repair=true")
         if type(merge) is not bool:
             raise ValueError('merge must be a boolean')
@@ -283,19 +498,34 @@ class Acceptance:
             if fresh and test_query.strip() and not filtered:
                 from project_test_suggestions import zero_query_feedback
                 result['zero_query_feedback'] = zero_query_feedback(self, report, tests, test_query, priority)
+            if self.catalog and len(self.requirements) > 40:
+                result['batch_diagnostics'] = self.batch_diagnostics(report, result['mapping_status']['unmapped_requirements'])
             return result
         if merge:
             plan = self.load()
             if not plan or plan.get('version') != 2 or not isinstance(items, list) or not items:
                 raise ValueError('merge requires an existing requirement-ID plan and nonempty updates')
-            # Validate incoming rows before using their IDs to remove old rows.
+            # Merge adds criteria; only an exact criterion/group identity updates
+            # an existing row. Shared requirement IDs never delete sibling criteria.
+            updates = {}
+            identity = lambda row: (row['criterion'], tuple(sorted(set(row['requirement_ids']))))
             for row in items:
-                if not isinstance(row, dict) or not isinstance(row.get('requirement_ids'), list) or not row['requirement_ids'] or any(key not in self.by_id for key in row['requirement_ids'] if isinstance(key, str)) or any(not isinstance(key, str) for key in row['requirement_ids']):
-                    raise ValueError('Updates require valid requirement_ids')
-            replaced = {key for row in items for key in row['requirement_ids']}
-            retained = [{**row, 'requirement_ids': [key for key in row['requirement_ids'] if key not in replaced]}
-                        for row in plan['items'] if any(key not in replaced for key in row['requirement_ids'])]
-            items = retained + items
+                if (not isinstance(row, dict) or set(row)-{'requirement_ids','criterion','tests','quote'}
+                        or not isinstance(row.get('requirement_ids'), list) or not row['requirement_ids']
+                        or any(not isinstance(key, str) or key not in self.by_id for key in row['requirement_ids'])):
+                    raise ValueError('Updates require valid requirement_ids and acceptance row fields')
+                self.check_criterion(row)
+                key = identity(row)
+                if key in updates:
+                    if set(updates[key]['tests']) != set(row['tests']):
+                        raise ValueError('Conflicting duplicate criterion/group updates; no acceptance rows changed')
+                    continue
+                updates[key] = dict(row)
+            merged = []
+            for row in plan['items']:
+                update = updates.pop(identity(row), None)
+                merged.append({**update, 'requirement_ids': list(row['requirement_ids'])} if update is not None else row)
+            items = merged + list(updates.values())
         items = self.check_items(items, require_complete=complete)
         previous = self.load()
         if previous and previous.get("version") == 2:
@@ -308,29 +538,48 @@ class Acceptance:
             value['requirement_sources'] = {row['id']:row['source_id'] for row in self.requirements}
         if len(json.dumps(value, ensure_ascii=False).encode('utf-8')) > 2 * 1024 * 1024:
             raise ValueError('Acceptance plan exceeds readable storage size; existing plan preserved')
-        if self.catalog:
-            self.archive_previous_plan()
-        atomic_json(self.path, value)
+        unchanged = previous == value
+        if not unchanged:
+            if self.catalog:
+                self.archive_previous_plan()
+            atomic_json(self.path, value)
         coverage = self.evaluate(report)
         missing = [{'item': row['id'], 'tests': [t for t in row['missing_tests'] if t != 'host:arabic_response']}
                    for row in coverage['items'] if any(t != 'host:arabic_response' for t in row['missing_tests'])]
-        result = {'saved': True, 'items': len(items), 'request_key': self.key,
+        status = self.mapping_status(report)
+        result = {'saved': not unchanged, 'unchanged': unchanged, 'items': len(items), 'request_key': self.key,
+                'catalog_revision': (self.catalog or {}).get('revision'),
                 'missing_evidence': missing, 'validation_current': self.fresh(report),
-                'mapping_status': self.mapping_status(report),
+                'mapping_status': status,
                 'repair_proposal': repair_proposal(self, report),
                 'next_action': 'Repair only reported or unmapped rows with merge=true.' if missing or coverage.get('error') else 'Deliver the final answer now; final host checks remain mandatory. Do not repeat catalog queries or validation without a source change or actual failure.',
                 'note': 'Final delivery checks fresh evidence and the final response; host:arabic_response is evaluated then.'}
+        if status['unmapped_requirements']:
+            result['next_action'] = 'Draft saved. Map only the next unmapped requirements with complete=false and merge=true. Unmapped requirements still block delivery.'
+            if self.fresh(report):
+                result['successful_tests'] = list(dict.fromkeys(
+                    test for check in report.get('checks', []) if check.get('passed')
+                    and check.get('validation_run_id') and check.get('executed', 0) > 0
+                    for test in check.get('successful_tests', [])))[:16]
+            result['batch_diagnostics'] = self.batch_diagnostics(report, status['unmapped_requirements'])
+            partial = self.evaluate(report, allow_partial=True)
+            if self.fresh(report):
+                result['verified_batch_ids'] = list(dict.fromkeys(
+                    key for row in partial.get('items', []) if row['passed']
+                    for key in row.get('requirement_ids', [])))
         if self.catalog and self.catalog.get('review_issues'):
             result['source_review_issues'] = self.catalog['review_issues']
             result['next_action'] = 'Use review_project_requirements with the current revision and source_requirements. Correct review metadata before mapping acceptance; use whole_source=true only for explicitly reviewed atomic blocks. Preserve passing project files and tests.'
         if missing:
             result['evidence_repair'] = evidence_repair(report, missing, self.fresh(report))
             result['next_step'] = self.repair_message(report, coverage)
+        if unchanged:
+            result['next_action'] = 'No acceptance plan change was saved. Do not resubmit this identical row. Review the current execution stage and implement/test its missing behavior or map a genuinely unmapped relevant criterion. All prior criteria and links remain unchanged.'
         return result
 
     def mapping_status(self, report):
         """Bounded actionable defects; no inferred success or automatic behavior mapping."""
-        coverage = self.evaluate(report)
+        coverage = self.evaluate(report, allow_partial=True)
         successful = [name for check in (report or {}).get('checks', [])
                       if check.get('passed') and check.get('validation_run_id') and check.get('executed', 0) > 0
                       for name in check.get('successful_tests', [])] if self.fresh(report) else []
@@ -346,7 +595,8 @@ class Acceptance:
             if row.get('target_reference_review',{}).get('missing_targets'):
                 from project_acceptance_targets import review_candidates
                 candidates = review_candidates(self, report, row, successful)
-            unranked = not candidates and not criterion_requirements(row['criterion'])
+            unranked = (not candidates and not criterion_requirements(row['criterion'])
+                        and not row.get('target_reference_review', {}).get('observable_review', {}).get('missing'))
             if unranked:candidates = successful[:6]
             defects.append({'item_id':row['id'], 'requirement_ids': row.get('requirement_ids', []), 'missing_tests': missing,
                             'candidate_successful_tests': candidates,
@@ -355,10 +605,29 @@ class Acceptance:
                             'target_reference_review':row.get('target_reference_review',{})})
         plan=self.load()
         covered={key for row in (plan or {}).get('items',[]) for key in row.get('requirement_ids',[])}
+        unmapped = [row for row in self.requirements if row['id'] not in covered]
         return {'missing_plan': coverage.get('missing_plan', False), 'error': coverage.get('error'),
-                'unmapped_requirements':[row for row in self.requirements if row['id'] not in covered],
+                'unmapped_requirements':unmapped,
                 'defects': defects, 'final_response_pending': any('host:arabic_response' in row['missing_tests'] for row in coverage.get('items', [])),
-                'ready_for_final_response': bool(coverage.get('mandatory_named_tests_executed')) and not defects and not coverage.get('missing_plan') and not coverage.get('error') and self.fresh(report)}
+                'ready_for_final_response': bool(coverage.get('mandatory_named_tests_executed')) and not unmapped and not defects and not coverage.get('missing_plan') and not coverage.get('error') and self.fresh(report)}
+
+    def batch_diagnostics(self, report, rows):
+        from project_test_suggestions import nearby_tests
+        fresh = self.fresh(report)
+        tests = [test for check in (report or {}).get('checks', [])
+                 if check.get('passed') and check.get('validation_run_id') and check.get('executed', 0) > 0
+                 for test in check.get('successful_tests', [])] if fresh else []
+        pending = set((self.catalog or {}).get('pending_obligation_reviews', []))
+        diagnostics = []
+        for row in rows[:8]:
+            needs_review = row.get('source_requirement_id', row['id']) in pending
+            candidates = [] if needs_review else nearby_tests(tests, report, row['text'])[:2]
+            reason = ('source_review_required' if needs_review else 'fresh_validation_required' if not fresh else
+                      'review_executed_candidates_and_link' if candidates else 'no_ranked_test_candidate')
+            diagnostics.append({'id': row['id'], 'reason': reason,
+                                'executed_test_candidates': candidates,
+                                'requires_assertion_review': bool(candidates)})
+        return diagnostics
 
     def repair_message(self, report, coverage=None):
         coverage = self.evaluate(report) if coverage is None else coverage
@@ -412,6 +681,10 @@ class Acceptance:
                 raise ValueError('Acceptance plan exceeds 40 items including delivery constraints')
             missing = [key for key in self.by_id if key not in covered]
             if missing and require_complete:
+                if len(missing) > 8:
+                    raise ValueError(f'Unmapped requirement IDs: {len(missing)} remain. '
+                                     'Save reviewed rows with complete=false, then add batches with merge=true. '
+                                     'Query acceptance_plan for the next missing batch.')
                 raise ValueError('Unmapped requirement IDs: ' + ', '.join(missing) + '; exact requirements: ' + json.dumps(
                     [row for row in self.requirements if row['id'] in missing], ensure_ascii=False))
             return normalized
@@ -443,7 +716,7 @@ class Acceptance:
                 not isinstance(t, str) or not t.startswith(('python:', 'node:', 'host:', 'browser:')) or '*' in t or len(t) > 600 for t in tests):
             raise ValueError('Use exact named test or host/browser evidence IDs, never generic suite results')
 
-    def evaluate(self, report):
+    def evaluate(self, report, *, allow_partial=False):
         if self.catalog and self.catalog.get('review_issues'):
             return {'passed':False, 'items':[], 'error':'Requirement sources need review: ' +
                     '; '.join(self.catalog['review_issues'])}
@@ -451,7 +724,7 @@ class Acceptance:
         if not plan:
             return {'passed': False, 'missing_plan': True, 'items': [], 'scope': 'Current request and current brief'}
         try:
-            items = self.check_items(plan['items'])
+            items = self.check_items(plan['items'], require_complete=not (allow_partial and self.catalog))
         except (ValueError, KeyError, TypeError) as error:
             return {'passed': False, 'error': str(error), 'items': []}
         successful = set()
@@ -490,7 +763,9 @@ class Acceptance:
                          'primary_host_evidence': {t:receipts[t] for t in required if t in receipts},
                          'named_tests_require_assertion_review': [t for t in row['tests'] if t.startswith(('python:','node:'))],
                          'evidence': {t: receipts[t] for t in row['tests'] if t in receipts}})
-        return {'passed': tests_executed and bool(rows) and all(r['passed'] for r in rows) and self.fresh(report), 'items': rows,
+        covered = {key for row in rows for key in row.get('requirement_ids', [])}
+        complete = not self.catalog or covered == set(self.by_id)
+        return {'passed': complete and tests_executed and bool(rows) and all(r['passed'] for r in rows) and self.fresh(report), 'items': rows,
                 'mandatory_named_tests_executed': tests_executed,
                 'request_key': self.key, 'scope': 'Mapped test execution; semantic relevance requires review'}
 
@@ -520,5 +795,6 @@ def host_evidence(workspace, initial_tests, job, final='', browser=None):
         from project_comment_evidence import evidence as comment_evidence
         result['host:source_comments_preserved']=comment_evidence(workspace,job)
     for name, proof in (browser or {}).items():
-        result[name] = {**proof, 'passed': bool(proof.get('passed') and proof.get('fingerprint') == fingerprint)}
+        result[name] = {**proof, 'observed_passed': proof.get('passed') is True,
+                        'passed': bool(proof.get('passed') and proof.get('fingerprint') == fingerprint)}
     return result

@@ -7,6 +7,10 @@ import time
 from project_metrics import stream_measurement
 
 
+class NativeFormatError(ValueError):
+    pass
+
+
 class GenerationInterrupted(Exception):
     pass
 
@@ -114,7 +118,10 @@ def consume(response, interrupted, update, *, progress_timeout=45, total_timeout
                 return {'message':message, 'finish_reason':finish}
             event = json.loads(data)
             if event.get('error'):
-                raise RuntimeError(str(event['error']))
+                error = event['error']
+                if isinstance(error, dict) and error.get('code') == 500 and error.get('message') == 'The model produced output that does not match the expected peg-native format':
+                    raise NativeFormatError(str(error))
+                raise RuntimeError(str(error))
             if isinstance(event.get('usage'), dict):
                 usage.update(event['usage'])
             if isinstance(event.get('timings'), dict):

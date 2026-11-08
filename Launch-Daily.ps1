@@ -18,6 +18,15 @@ foreach($service in @(@{Name='studio';Script='project_studio.py';Port=18078;Pid=
         continue
     }
     $scriptPath=Join-Path $PSScriptRoot $service.Script
+    $servicePython=$runtimePython
+    $studioRuntimeConfig=Join-Path $serviceLog 'studio-runtime.json'
+    if($service.Name -eq 'studio' -and (Test-Path -LiteralPath $studioRuntimeConfig)) {
+        $studioRuntime=Get-Content -LiteralPath $studioRuntimeConfig -Raw | ConvertFrom-Json
+        $studioPython=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot $studioRuntime.python))
+        $environmentRoot=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '.environments'))+[IO.Path]::DirectorySeparatorChar
+        if(-not $studioPython.StartsWith($environmentRoot,[StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $studioPython)) {throw 'Invalid isolated studio runtime.'}
+        $servicePython=$studioPython
+    }
     $bootstrapId=[Guid]::NewGuid().ToString('N')
     $bootstrapOut=Join-Path $serviceLog ('logs/'+$service.Name+'-bootstrap-'+$bootstrapId+'.stdout.log')
     New-Item -ItemType Directory -Path (Join-Path $serviceLog 'logs') -Force | Out-Null
@@ -25,7 +34,7 @@ foreach($service in @(@{Name='studio';Script='project_studio.py';Port=18078;Pid=
     # The bootstrap preserves startup errors and native crash traces in a real file.
     $startup=New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ShowWindow=[uint16]0}
     $bootstrap=Join-Path $PSScriptRoot 'service_bootstrap.py'
-    $command='"'+$runtimePython+'" -E -s -u "'+$bootstrap+'" "'+$scriptPath+'" "'+$bootstrapOut+'"'
+    $command='"'+$servicePython+'" -E -s -u "'+$bootstrap+'" "'+$scriptPath+'" "'+$bootstrapOut+'"'
     $created=Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=$command;CurrentDirectory=$PSScriptRoot;ProcessStartupInformation=$startup}
     if($created.ReturnValue -ne 0){throw "Independent service launch failed: $($created.ReturnValue). Existing services were preserved."}
     $process=Get-Process -Id $created.ProcessId -ErrorAction Stop

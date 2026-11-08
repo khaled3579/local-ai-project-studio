@@ -29,11 +29,7 @@ def stream_measurement(usage, timings, started, first_token, outcome):
             'predicted_per_second': _number(timings.get('predicted_per_second'))}
 
 
-def record_generation(job, workspace, measurement, request_id, *, step, protocol, estimated_input):
-    """Saved totals survive resume in the existing job checkpoint. Unknown != zero."""
-    totals = job.setdefault('token_usage', {'requests': 0, 'measured_requests': 0,
-                                           'prompt_tokens': 0, 'completion_tokens': 0,
-                                           'incomplete_requests': 0, 'seconds': 0.0})
+def accumulate_usage(totals, measurement):
     totals['requests'] += 1
     if measurement.get('outcome') in {'complete','length'} and measurement.get('token_accounting_complete') is not False and all(_tokens(measurement.get(k)) is not None for k in ('prompt_tokens','completion_tokens')):
         totals['measured_requests'] += 1
@@ -45,8 +41,22 @@ def record_generation(job, workspace, measurement, request_id, *, step, protocol
     totals['missing_usage_requests']=totals['requests']-totals['measured_requests']
     totals['usage_complete']=totals['missing_usage_requests']==0
     totals['observed_tokens_are_lower_bound']=not totals['usage_complete']
+
+
+def record_generation(job, workspace, measurement, request_id, *, step, protocol, estimated_input):
+    """Saved totals survive resume in the existing job checkpoint. Unknown != zero."""
+    def empty():
+        return dict(requests=0, measured_requests=0, prompt_tokens=0, completion_tokens=0,
+                    incomplete_requests=0, seconds=0.0)
+
+    totals = job.setdefault('token_usage', empty())
+    accumulate_usage(totals, measurement)
+    last_action = (job.get('efficiency') or {}).get('last_action') or {}
+    phase = last_action.get('category', 'initial')
+    accumulate_usage(job.setdefault('token_usage_by_phase', {}).setdefault(phase, empty()), measurement)
     receipt = {**measurement, 'id': request_id, 'job_id': job['id'], 'step': step,
-               'protocol': protocol, 'estimated_input_tokens': estimated_input, 'time': time.time()}
+               'protocol': protocol, 'estimated_input_tokens': estimated_input, 'time': time.time(),
+               'phase': phase}
     job['last_inference'] = receipt
     try:
         from project_progress import generation_outcome

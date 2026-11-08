@@ -45,9 +45,11 @@ def resolved(state,recovery,counter):
 
 
 def lane(name,result):
+    if name == 'project_plan' or result.get('next_tool') == 'project_plan':return 'planning'
+    if result.get('next_tool') in {'review_project_requirements', 'link_acceptance_evidence', 'acceptance_plan'}:return 'acceptance'
     if name=='transport_error':return 'transport'
     if name in {'generation_loop','generation_limit','protocol_error'}:return 'protocol'
-    if name in {'acceptance_plan','review_project_requirements'}:return 'acceptance'
+    if name in {'acceptance_plan','link_acceptance_evidence','review_project_requirements'}:return 'acceptance'
     return 'project'
 
 
@@ -55,6 +57,7 @@ def next_step(state):
     recovery=state.get('pending_recovery')
     if recovery:
         return {'action':{'transport':'restore connection and resume the saved cursor',
+            'planning':'read the current project plan and correct only the missing stage, dependency, or declared evidence',
             'protocol':'correct only the rejected tool envelope; no source repair',
             'acceptance':'repair only missing requirement review or evidence links',
             'project':'inspect the first actual failing diagnostic and patch its cause'}[recovery],
@@ -75,15 +78,30 @@ def update_requirements(job,requirements,coverage=None,fingerprint=None):
     state['completed_requirement_ids']=[key for key in all_ids if key in complete]
     state['remaining_requirement_ids']=[key for key in all_ids if key not in complete]
     state['requirements_fingerprint']=fingerprint
+    rows = (coverage or {}).get('items', [])
+    if ((coverage or {}).get('validation_current') and rows and not (coverage or {}).get('error')
+            and all(row.get('passed') is True for row in rows)):
+        resolved(state,'acceptance','recovery_resolved_after_progress')
     change=state.get('last_source_change')
     if complete and change and change['fingerprint']==fingerprint:
         state.setdefault('first_useful_edit_at',change['time'])
     state['next_step']=next_step(state)
 
 
+def update_plan(job, plan):
+    """Resolve a planning recovery from current usable state, never final delivery."""
+    state=tracker(job)
+    stages=plan.get('stages') or ([plan['stage']] if plan.get('stage') else [])
+    if (not plan.get('plan_required') and not plan.get('needs_review')
+            and not plan.get('open_questions') and not plan.get('open_question_count')
+            and (any(row.get('status')=='active' for row in stages) or plan.get('ready_for_delivery') is True)):
+        resolved(state,'planning','recovery_resolved_after_progress')
+    state['next_step']=next_step(state)
+
+
 def observe(job,name,arguments,result,before,after,*,epoch=0,browser_fingerprint=None):
     state=tracker(job);now=time.time()
-    category='reading' if name in READS else 'verification' if name in VALIDATION else 'acceptance' if name in {'acceptance_plan','review_project_requirements'} else 'protocol' if name.startswith('generation_') else 'execution'
+    category='reading' if name in READS else 'verification' if name in VALIDATION else 'acceptance' if name in {'acceptance_plan','link_acceptance_evidence','review_project_requirements'} else 'planning' if name == 'project_plan' else 'protocol' if name.startswith('generation_') else 'execution'
     key=digest([name,arguments,after,epoch if name in READS else None])
     repeated=key in state['seen_actions']
     state['seen_actions']=(state['seen_actions']+[key])[-256:]
@@ -98,12 +116,15 @@ def observe(job,name,arguments,result,before,after,*,epoch=0,browser_fingerprint
                 or isinstance(detail,dict) and detail.get('assertion',{}).get('passed') is False)
     progress=[];evidence=[]
     if before!=after:
-        progress.append('source_changed')
-        if name=='patch_file' and result.get('saved') and isinstance(result.get('sha256'),str):
-            state.setdefault('source_patch_receipts',{})[result['saved']]={'sha256':result['sha256'],
-                'before_fingerprint':before,'after_fingerprint':after}
-        state.setdefault('first_source_change_at',now)
-        state['last_source_change']={'time':now,'fingerprint':after}
+        # Tests/builds changing their own validation input invalidate the check;
+        # they do not prove implementation progress or reset its request gap.
+        if name != 'validate_project':
+            progress.append('source_changed')
+            if name=='patch_file' and result.get('saved') and isinstance(result.get('sha256'),str):
+                state.setdefault('source_patch_receipts',{})[result['saved']]={'sha256':result['sha256'],
+                    'before_fingerprint':before,'after_fingerprint':after}
+            state.setdefault('first_source_change_at',now)
+            state['last_source_change']={'time':now,'fingerprint':after}
         # All old requirement completion needs re-evaluation on new source.
         if state.get('requirements_fingerprint')!=after:
             state['remaining_requirement_ids']=list(dict.fromkeys(state['remaining_requirement_ids']+state['completed_requirement_ids']))
@@ -118,20 +139,37 @@ def observe(job,name,arguments,result,before,after,*,epoch=0,browser_fingerprint
     new=[key for key in evidence if key not in state['evidence_keys']]
     if new:progress.append('new_valid_evidence')
     state['evidence_keys']=(state['evidence_keys']+new)[-2048:]
-    if name=='acceptance_plan' and result.get('validation_current') and result.get('saved') and result.get('mapping_status',{}).get('ready_for_final_response'):
+    if name in {'acceptance_plan','link_acceptance_evidence'} and result.get('validation_current') and result.get('saved') and result.get('mapping_status',{}).get('ready_for_final_response'):
         key=digest(['acceptance',result.get('request_key'),after])
         if key not in state['evidence_keys']:
             progress.append('accepted_mapping');state['evidence_keys'].append(key)
-    if progress:state['progress_events']+=1
+    if name == 'review_project_requirements' and result.get('saved'):
+        reviewed = state.setdefault('reviewed_source_blocks', [])
+        new_blocks = [key for key in result.get('reviewed_blocks', []) if key not in reviewed]
+        if new_blocks:
+            reviewed.extend(new_blocks)
+            progress.append('source_review_saved')
+    if name in {'acceptance_plan','link_acceptance_evidence'} and result.get('saved') and result.get('validation_current'):
+        batch = [digest(['verified_requirement', key, after, result.get('catalog_revision')])
+                 for key in result.get('verified_batch_ids', [])]
+        new_links = [key for key in batch if key not in state['evidence_keys']]
+        if new_links:
+            state['evidence_keys'] = (state['evidence_keys'] + new_links)[-2048:]
+            progress.append('verified_batch_links')
+    if progress:
+        state['progress_events'] += 1
+        state['last_progress_request'] = (job.get('token_usage') or {}).get('requests', 0)
+        state['last_useful_action'] = {'tool': name, 'action': state['actions'], 'progress': progress}
     reused=bool(result.get('reused_execution') or result.get('reused_read') or result.get('reused_validation'))
     if repeated and not progress and not reused:state['repeat_without_progress_candidates']+=1
     if failed:
         failure(state,lane(name,result))
     elif name=='validate_project' and result.get('success') is True and result.get('fingerprint')==after and result.get('source_unchanged_during_validation') is True and evidence:
         resolved(state,'project','recovery_resolved_after_progress')
-    elif name=='acceptance_plan' and result.get('validation_current') and result.get('mapping_status',{}).get('ready_for_final_response'):
+    elif name in {'acceptance_plan','link_acceptance_evidence'} and result.get('validation_current') and result.get('mapping_status',{}).get('ready_for_final_response'):
         resolved(state,'acceptance','recovery_resolved_after_progress')
     row={'number':state['actions'],'time':now,'tool':name,'category':category,
+         'workspace_changed_during_validation': name == 'validate_project' and before != after,
          'repeated_on_same_source':repeated,'progress':progress,
          'outcome':'failed' if failed else 'not_executed' if result.get('not_executed') else 'waiting_for_user' if result.get('waiting_for_user') else 'completed',
          'before_fingerprint':before,'after_fingerprint':after,
@@ -140,6 +178,16 @@ def observe(job,name,arguments,result,before,after,*,epoch=0,browser_fingerprint
     state['last_action']=row;state['history']=(state['history']+[row])[-128:]
     state['next_step']=next_step(state)
     return row
+
+
+def generation_checkpoint(job):
+    state = tracker(job)
+    requests = (job.get('token_usage') or {}).get('requests', 0)
+    gap = requests - state.get('last_progress_request', 0)
+    if gap < 4 or gap % 4:
+        return None
+    return {'requests_without_progress': gap, 'last_useful_action': state.get('last_useful_action'),
+            'next_step': next_step(state)}
 
 
 def generation_outcome(job,measurement):
@@ -190,6 +238,7 @@ def metrics(job):
 def cached_read(state,workspace,name,arguments,invoke,epoch):
     """Bounded saved views, verified against current source bytes and read epoch."""
     if name!='read_file':return invoke()
+    if str(arguments.get('path','')).replace('\\','/') == '.local-ai/PROJECT_PLAN.md':return invoke()
     # Hash the requested file, not the whole project. Source views depend on
     # these exact bytes. Epoch distinguishes a context recovery reread.
     path=workspace.path(arguments.get('path',''))

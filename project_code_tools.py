@@ -83,7 +83,17 @@ def search(ws, query, mode='text', path='', limit=30):
             hits.append({'path':row['path'],'line':line,'symbol':name,'kind':'definition (AST when source syntax is supported)' if mode=='definitions' else 'lexical '+mode,
                 'context':[{'line':i+1,'text':lines[i][:400]} for i in range(max(0,line-2),min(len(lines),line+1))]})
     hits.sort(key=lambda h:(h['symbol'].casefold()!=query.casefold(),h['path'],h['line']))
-    return {'matches':hits[:limit],'total_matches':total,'scanned_files':scanned,'skipped_budget':skipped,'truncated':total>limit,'reference_accuracy':'Python and valid JS/TS definitions use syntax ASTs, with lexical fallback for unsupported syntax; references are lexical, not language-server symbol resolution'}
+    result = {'matches':hits[:limit],'total_matches':total,'scanned_files':scanned,'skipped_budget':skipped,'truncated':total>limit,'reference_accuracy':'Python and valid JS/TS definitions use syntax ASTs, with lexical fallback for unsupported syntax; references are lexical, not language-server symbol resolution'}
+    result['query_semantics'] = 'Case-insensitive literal string; regex operators and globs are not interpreted. Use separate calls for alternatives.'
+    if not total and '|' in query:
+        terms = list(dict.fromkeys(part.strip() for part in query.split('|') if part.strip()))
+        if len(terms) > 1:
+            result['search_guidance'] = 'No literal matches. If the pipe was intended as alternatives, use these separate literal searches; they have not been executed.'
+            result['next_calls'] = [{'tool':'search_project', 'arguments':{
+                'query':term,'mode':mode,'path':path,'limit':limit}} for term in terms[:6]]
+            result['suggestions_truncated'] = len(terms) > 6
+    return result
+
 
 
 def diagnose(ws,path=''):

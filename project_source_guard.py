@@ -169,6 +169,56 @@ def reject_new_duplicates(before, after):
                          'Update the existing definition instead of appending a shadowing copy. Scopes: ' + ', '.join(added[:6]))
 
 
+def syntax_diagnostic(message, content, base_sha256):
+    """Rejected proposal only: it has never replaced the current source."""
+    match = re.search(r':(\d+)(?::\d+)?(?:\r?\n|$)', message)
+    line = int(match[1]) if match else None
+    lines = content.splitlines(); start = max(0,(line or 1)-6)
+    excerpt = '\n'.join(f'{i+1}: {lines[i]}' for i in range(start,min(len(lines),start+11)))[:4000]
+    return {'candidate_saved':False,'base_sha256':base_sha256,
+            'candidate_sha256':hashlib.sha256(content.encode('utf8')).hexdigest(),
+            'candidate_line':line,'candidate_excerpt':excerpt,
+            'next_action':'Correct the REJECTED proposal from the preserved failed call; these lines are NOT current source. No edit was committed. Read current source for exact patch anchors/SHA, preserve existing behavior, then submit one corrected valid change. Browser assertions or validation on the unchanged old file cannot test this proposal. Never patch a rejected excerpt as though it were the current file. Duplicate exports must use either declaration exports or an export list for the same name, not both. Existing retry and acceptance gates remain in force.'}
+
+
+def syntax_repair_checkpoint(messages, workspace):
+    calls = {call.get('id'):call.get('function') or {} for message in messages
+             for call in message.get('tool_calls',[]) if message.get('role')=='assistant'}
+    seen = set()
+    for message in reversed(messages):
+        function = calls.get(message.get('tool_call_id'))
+        if message.get('role')!='tool' or not function or function.get('name') not in {'write_file','patch_file'}:
+            continue
+        try:
+            args=json.loads(function.get('arguments') or '{}'); value=json.loads(message.get('content') or '{}')
+            if not isinstance(args,dict) or not isinstance(value,dict):continue
+            name=args['path']; path=workspace.path(name)
+            if name in seen:continue
+            if value.get('saved') and value.get('sha256') and not value.get('error'):
+                seen.add(name);continue
+            if not str(value.get('error','')).startswith('JavaScript syntax rejected;'):continue
+            seen.add(name)
+            current=path.read_bytes() if path.exists() else None
+            sha=hashlib.sha256(current).hexdigest() if current is not None else None
+            base=(value.get('syntax_repair') or {}).get('base_sha256',args.get('expected_sha256'))
+            if sha!=base or sha is not None and not base:continue
+            proposal=args.get('content') if function['name']=='write_file' else None
+            if proposal is None and current is not None:
+                source=current.decode('utf8').replace('\r\n','\n'); old=args.get('old_text','').replace('\r\n','\n')
+                if old and source.count(old)==1:proposal=source.replace(old,args.get('new_text','').replace('\r\n','\n'),1)
+            diagnostic=value.get('syntax_repair') or (syntax_diagnostic(value['error'],proposal,base) if isinstance(proposal,str) else None)
+            if diagnostic:return {'path':name,**diagnostic}
+        except (ValueError,TypeError,KeyError,OSError):
+            continue
+    return None
+
+
+def syntax_recovery_tools(tools, checkpoint):
+    if not checkpoint:return tools
+    withheld={'browser_project','validate_project','acceptance_plan','link_acceptance_evidence','run_project','diagnose_project','export_project'}
+    return [entry for entry in tools if entry['function']['name'] not in withheld]
+
+
 def check_source(path, content, old_bytes=None):
     if path.suffix.lower() not in {'.py','.pyw','.js','.mjs','.cjs','.ts','.tsx','.jsx'}:
         return
@@ -190,7 +240,9 @@ def check_source(path, content, old_bytes=None):
                               encoding='utf-8',errors='replace',timeout=15,
                               creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
         if result.returncode:
-            raise ValueError('JavaScript syntax rejected; existing file preserved. '+result.stderr[-4000:])
+            error=ValueError('JavaScript syntax rejected; existing file preserved. '+result.stderr[-4000:])
+            error.syntax_repair=syntax_diagnostic(result.stderr,content,hashlib.sha256(old_bytes).hexdigest() if old_bytes is not None else None)
+            raise error
         parser = Path(__file__).resolve().parent/'runtime/assistant/node_modules/typescript/lib/typescript.js'
         parsed = subprocess.run([node, '-e', JS_DEFINITIONS, str(parser)],
                                 input=json.dumps({'path':str(path), 'old':previous, 'content':content}),

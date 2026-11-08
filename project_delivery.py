@@ -19,6 +19,10 @@ def missing_delivery_files(workspace, text):
             name=re.sub(r':\d+$','',name)
             if PurePosixPath(name.replace('\\','/')).suffix.lower() not in FILE_TYPES:
                 continue
+            if name.replace('\\', '/') == '.local-ai/PROJECT_PLAN.md':
+                plan = workspace.meta / 'PROJECT_PLAN.md'
+                if plan.is_file() and not plan.is_symlink() and plan.resolve().is_relative_to(workspace.meta.resolve()):
+                    continue
             try:exists=workspace.path(name).is_file()
             except ValueError:exists=False
             # A bare filename in prose may identify one nested deliverable.

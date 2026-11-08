@@ -75,18 +75,49 @@ function walk(node, suites, contexts) {
       }
       if (kind === 'test') {
         const identifiers = new Set();
+        const assertions = [], observableActions = [], initializers = new Map();
+        // Keep assertion data separate from identifier references: strings and
+        // comments must never satisfy an explicit production symbol target.
+        for (const statement of root.statements) if (ts.isVariableStatement(statement))
+          for (const d of statement.declarationList.declarations)
+            if (ts.isIdentifier(d.name) && d.initializer) initializers.set(d.name.text, d.initializer);
         const nestedContexts = new Set(contexts);
         const parameter = callback.parameters[0];
         if (parameter && ts.isIdentifier(parameter.name)) nestedContexts.add(parameter.name.text);
-        function references(n) {
+        function references(n, nested = false) {
           // A child registration has its own receipt. Its assertions cannot
           // provide target references for the parent's successful receipt.
           if (ts.isCallExpression(n) && registration(n.expression, nestedContexts)) return;
           if (ts.isIdentifier(n)) identifiers.add(n.text);
-          ts.forEachChild(n, references);
+          if (!nested && ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.initializer)
+            initializers.set(n.name.text, n.initializer);
+          if (!nested && ts.isCallExpression(n) && /^(?:assert(?:\.|$)|expect$)/.test(callName(n.expression)))
+            assertions.push(n);
+          if (!nested && ts.isCallExpression(n) && /\.(?:click|fill|selectOption|press|dispatchEvent|onclick|check|uncheck|post|put|patch|delete|setItem)$/.test(callName(n.expression)))
+            observableActions.push(callName(n.expression));
+          ts.forEachChild(n, child => references(child, nested || ts.isFunctionLike(n)));
         }
         references(callback.body);
+        function assertionData(n, seen = new Set(), depth = 0) {
+          if (depth > 8) return '';
+          if (ts.isIdentifier(n) && initializers.has(n.text) && !seen.has(n.text)) {
+            const next = new Set(seen); next.add(n.text);
+            return assertionData(initializers.get(n.text), next, depth + 1);
+          }
+          if (ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) return JSON.stringify(n.text);
+          if (ts.isIdentifier(n)) return n.text;
+          if (ts.isPropertyAccessExpression(n)) return assertionData(n.expression, seen, depth + 1) + '.' + n.name.text;
+          // TypeScript stops walking when the visitor returns a truthy value.
+          // Array.push returns a length: use a block so EVERY child/argument is read.
+          const parts = []; ts.forEachChild(n, child => { parts.push(assertionData(child, seen, depth + 1)); });
+          return parts.join(' ');
+        }
+        // Exclude assertion messages; only actual and expected inputs count.
+        const observableAssertions = assertions.map(n => [...n.arguments].slice(0, /^(?:assert|assert\.ok|expect)$/.test(callName(n.expression)) ? 1 : 2)
+          .map(a => assertionData(a)).join(' ')).slice(0, 40);
         result.push({name: title, suite: suites.join('.'), identifiers: [...identifiers],
+                     observable_assertions: observableAssertions,
+                     observable_actions: [...new Set(observableActions)].slice(0, 40),
                      line: root.getLineAndCharacterOfPosition(node.getStart(root)).line + 1});
         walk(callback.body, [...suites, title], nestedContexts);
         return;
@@ -142,6 +173,8 @@ def node_reference(workspace, report, identity):
             return {'identifiers': [], 'diagnostic': 'Test callback is absent, dynamic or ambiguous; inspect the exact assertion'}
         row = matching[0]
         return {'identifiers': row['identifiers'], 'file': relative, 'line': row['line'],
+                'observable_assertions': row.get('observable_assertions', []),
+                'observable_actions': row.get('observable_actions', []),
                 'source_sha256': source_sha, 'scope': 'Static references in the exact executed test callback; assertion meaning still requires review.'}
     except (OSError, UnicodeError, ValueError, subprocess.SubprocessError) as error:
         return {'identifiers': [], 'diagnostic': 'Cannot inspect static test references: ' + str(error)[:1200]}

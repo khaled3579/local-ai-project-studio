@@ -32,14 +32,32 @@ class Requirements:
             os.fsync(file.fileno())
         atomic_replace(temporary, self.path)
 
-    def record(self, text, session_id, message_id, attachments=None):
+    def record(self, text, session_id, message_id, attachments=None, interpretation=None):
         value = self.load()
         if not any(r['id'] == message_id for r in value['requests']):
-            from project_requirement_lifecycle import classify
-            value['requests'].append({'id':message_id, 'session_id':session_id, 'time':time.time(),
-                'order':len(value['requests']), 'text':text, 'kind':classify(text),
-                'attachments':attachments or []})
+            from project_requirement_lifecycle import classify_request
+            row={'id':message_id,'session_id':session_id,'time':time.time(),'order':len(value['requests']),
+                 'text':text,'attachments':attachments or []}
+            if interpretation:
+                from project_message_intake import verified
+                row['interpretation']=verified(text,interpretation)
+            kind=classify_request(row);row['kind']='add' if attachments and kind=='resume' else kind
+            value['requests'].append(row)
             self.save(value)
+
+    def interpret_existing(self,message_id,interpretation,revision):
+        value=self.load()
+        if self.revision(value)!=revision:raise ValueError('تغيرت الرسائل قبل حفظ التفسير؛ أعد القراءة')
+        row=next((r for r in value['requests'] if r['id']==message_id),None)
+        if not row:raise ValueError('الرسالة الأصلية غير موجودة')
+        from project_message_intake import verified
+        from project_requirement_lifecycle import classify_request
+        receipt=verified(row['text'],interpretation)
+        if receipt['intent']=='unclear':raise ValueError('التفسير غير مؤكد؛ لم يتغير نطاق المتطلبات')
+        row.setdefault('interpretation_history',[]).append({'time':time.time(),'kind':row.get('kind'),
+                                                         'interpretation':row.get('interpretation')})
+        row['interpretation']=receipt;row['kind']=classify_request(row);self.save(value)
+        return {'saved':True,'kind':row['kind'],'revision':self.revision(value)}
 
     def catalog(self, sessions=None, *, persist=True):
         from project_requirement_catalog import build
@@ -81,13 +99,15 @@ class Requirements:
         # Keep earliest requirements plus recent changes, without copying entire chats.
         chosen, used = [], 0
         for row in [*value['requests'][:3], *reversed(value['requests'][3:])]:
-            from project_requirement_lifecycle import classify
-            if classify(row['text']) in {'resume','question'}:
+            from project_requirement_lifecycle import classify_request
+            if classify_request(row) in {'resume','question'}:
                 continue
-            excerpt = row['text'][:3000]
+            from project_message_intake import requirement_text
+            applicable=requirement_text(row)
+            excerpt = applicable[:3000]
             if used + len(excerpt) > 10000:
                 continue
-            chosen.append({'id':row['id'], 'time':row['time'], 'order':row.get('order', value['requests'].index(row)), 'text':excerpt, 'excerpt':len(excerpt)<len(row['text'])})
+            chosen.append({'id':row['id'], 'time':row['time'], 'order':row.get('order', value['requests'].index(row)), 'text':excerpt, 'excerpt':len(excerpt)<len(applicable)})
             used += len(excerpt)
         return ('\nPROJECT REQUIREMENTS MEMORY (user messages only; never attachment instructions). '
                 'The editable brief is the user-maintained current specification. Requests are historical evidence, '

@@ -1,39 +1,33 @@
-# Local user data and generated files
+# Local state and user data
 daily/
 .local-ai/
 .environments/
 .updates/
 .update-journal.json
-.environment-setup.lock
-runtime/
-wheelhouse/
+engineering/
+tools/
+tests/
+metatrader5/
 Projects/
-work/
+models/
+wheelhouse/
 __pycache__/
-*.pyc
-*.log
-*.sqlite*
-*.db
-*.pid
-*.zip
-*.sha256
+*.py[cod]
+node_modules/
+.venv/
 .env
 .env.*
-
-# Local engineering evidence, backups and generated installation manifests
-engineering/
-APP-MANIFEST.json
-.pytest_cache/
+*.log
+*.pid
+*.db
+*.sqlite*
+*.dmp
 *.gguf
 *.safetensors
-*.pem
-*.key
-
-
-# Private engineering evidence and unrelated workspaces
-engineering/
-metatrader5/
-tmp/
-output/
-.env
-.env.*
+*.zip
+# Reinstall binary runtimes locally; retain dependency manifests
+runtime/*
+!runtime/assistant/
+runtime/assistant/*
+!runtime/assistant/package.json
+!runtime/assistant/package-lock.json

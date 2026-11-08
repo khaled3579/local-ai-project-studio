@@ -61,3 +61,4 @@
      value_to_json_internal(oss, val, 0, indent, item_sep, key_sep);
      JJ_DEBUG("value_to_json: result=%s", oss.str().c_str());
      return oss.str();
+

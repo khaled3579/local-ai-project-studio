@@ -1,6 +1,14 @@
 /* Live snapshots are presentation only. Reconnect never submits a task. */
 (() => {
   let latest = null, connected = false, stopped = false, controller;
+  const stopNotice = document.createElement('div');
+  stopNotice.id = 'taskStopNotice';
+  stopNotice.setAttribute('role', 'alert');
+  stopNotice.setAttribute('aria-live', 'assertive');
+  stopNotice.hidden = true;
+  stopNotice.style.cssText = 'position:sticky;top:0;z-index:1000;flex-shrink:0;width:100%;max-width:100vw;box-sizing:border-box;overflow-wrap:anywhere;padding:14px 18px;margin:10px 0;border:1px solid #e6a45a;border-radius:10px;background:#472c1c;color:#fff2df;white-space:pre-wrap;line-height:1.8;font-weight:600';
+  document.querySelector('.app-header').insertAdjacentElement('afterend', stopNotice);
+
   let memoryScope, memoryRevision, memoryOffset;
   const memoryButton = document.createElement('button');
   memoryButton.id = 'projectRequirements';
@@ -139,6 +147,15 @@
     acceptanceButton.textContent = acceptanceEvidence
       ? 'أدلة القبول · ' + acceptanceEvidence.requirements_coverage.items.filter(row => row.passed).length + '/' + acceptanceEvidence.requirements_coverage.items.length
       : 'أدلة القبول';
+    const stopJob = job || state.repair_run;
+    const stopReasons = {work_plan_stalled:'تكررت عمليات المرحلة دون دليل تقدم؛ راجع عائق المرحلة وخطوة المعالجة في خطة المشروع.',acceptance_stalled:'تكرر ربط أدلة القبول دون تقدم؛ راجع الرابط المحفوظ والدليل المنفذ المطلوب.',generation_stalled:'تكرر التوليد بلا أداة مكتملة؛ نقطة الاستئناف محفوظة.',format_recovery_stalled:'تعذر إنتاج استدعاء أداة صالح؛ نقطة الاستئناف محفوظة.'};
+    const stopStatus = ['paused', 'failed'].includes(stopJob?.status);
+    stopNotice.hidden = !stopStatus;
+    if (stopStatus) {
+      const reason = (stopJob?.status === 'failed' ? (stopJob.error || stopJob.phase) : stopJob.phase) || stopReasons[stopJob.stop_reason] || 'حُفظت نقطة الاستئناف؛ راجع حالة المرحلة قبل المتابعة.';
+      stopNotice.textContent = (stopJob.status === 'paused' ? 'المشروع لم يكتمل — المهمة متوقفة مؤقتاً والتقدم محفوظ.\n' : 'توقفت المهمة بسبب خطأ؛ المشروع غير معتمد كمكتمل.\n') + (reason || 'راجع عائق المرحلة في خطة المشروع قبل الاستئناف.');
+      if ($('operationPhase')) $('operationPhase').textContent = reason || 'المهمة متوقفة؛ راجع التنبيه أعلاه';
+    }
     const old = $('liveGeneration');
     if (!same) { old?.remove(); return; }
     if (!packet.generation || packet.job?.status !== 'running') {

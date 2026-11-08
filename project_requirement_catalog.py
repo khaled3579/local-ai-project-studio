@@ -17,9 +17,12 @@ def plain(text):
 
 
 def request_kind(text):
+    from project_intent import continuation_request
+    if continuation_request(text):
+        return 'continuation'
     normalized = plain(text)
     if normalized in {plain(x) for x in ('اكمل', 'اكمل من حيث توقفت', 'اكمل العمل', 'استئناف السلسلة', 'استكمال السلسلة',
-                       'تابع', 'متابعة', 'continue', 'resume', 'resume task', 'continue where you left off')}:
+                       'تابع', 'متابعة', 'continue', 'resume', 'resume task', 'continue where you left off', 'أعد المحاولة السابقة', 'قمت برفع السياق أعد المحاولة السابقة')}:
         return 'continuation'
     if normalized.startswith(('قدم اقتراحات', 'اقترح تحسينات', 'ما رايك', 'ماهي اقتراحات', 'suggest improvements')):
         return 'advisory'
@@ -57,15 +60,17 @@ def build(workspace, value, sessions=None, *, persist=True):
     old_sources = {row['id']:row for row in previous.get('sources', [])}
     history = None
     for request in value['requests']:
-        from project_requirement_lifecycle import classify
-        if classify(request['text']) not in {'add','amend'}:
+        from project_requirement_lifecycle import classify_request
+        from project_message_intake import requirement_text
+        kind=classify_request(request);source_text=requirement_text(request)
+        if kind not in {'add','amend'} and not (request.get('attachments') and kind == 'resume'):
             continue
         sid = 'request:' + request['id']
-        if sid in old_sources and old_sources[sid]['text'] != request['text']:
+        if sid in old_sources and old_sources[sid]['text'] != source_text:
             issues.append(sid + ': recorded original request changed; review required')
-        sources.append({'id':sid, 'kind':'user_request', 'text':request['text'],
+        sources.append({'id':sid, 'kind':'user_request', 'text':source_text,
                         'request_id':request['id'], 'session_id':request.get('session_id'),
-                        'recorded_at':request.get('time'), 'request_kind':classify(request['text'])})
+                        'recorded_at':request.get('time'), 'request_kind':kind})
         if request['id'] not in refs:
             if 'attachments' in request:
                 refs[request['id']] = request['attachments']
@@ -115,21 +120,42 @@ def build(workspace, value, sessions=None, *, persist=True):
                         'previous_revision':digest(value['revisions'][-1]['brief']) if value.get('revisions') else None,
                         'revision':digest(value['brief'])})
     active = {s['id'] for s in sources}
+    from project_requirement_lifecycle import classify_request
+    request_classes = {request['id']: ('add' if request.get('attachments') and classify_request(request) == 'resume' else classify_request(request)) for request in value['requests']}
+    control_sources = [row for row in previous.get('control_message_sources', [])
+                       if request_classes.get(row.get('request_id')) == 'resume']
     for sid, row in old_sources.items():
         if sid not in active and row['kind'] != 'user_brief':
+            if row['kind'] == 'user_request' and request_classes.get(row.get('request_id')) == 'resume':
+                control_sources.append({**row, 'classification': 'resume'})
+                continue
             issues.append(sid + ': source disappeared; explicit review required')
             sources.append(row)
     requirements = []
     for source in sources:
         seen = {}
+        source_rows = []
         for text in clauses(source['text']):
             key = digest([source['id'], text]); seen[key] = seen.get(key, 0) + 1
-            requirements.append({'id':'R_' + key[:24] + '_' + str(seen[key]), 'text':text,
-                                 'source_id':source['id'], 'source_kind':source['kind']})
+            source_rows.append({'id':'R_' + key[:24] + '_' + str(seen[key]), 'text':text,
+                                'source_id':source['id'], 'source_kind':source['kind']})
+        for index, row in enumerate(source_rows[:-1]):
+            # Keep stable IDs and exact source text, but separate a bare list
+            # prefix from its following behavioral clause. Decimal values and
+            # standalone numbers in user requests are not list prefixes.
+            marker = row['text']
+            following = source_rows[index + 1]
+            if (source['kind'] == 'referenced_specification' and re.fullmatch(r'\d{1,3}\.', marker)
+                    and re.search(r'\w', following['text']) and not re.fullmatch(r'\d+[.)]', following['text'])
+                    and re.search(r'(?m)^\s*' + re.escape(marker) + r'[^\S\n]+'
+                                  + re.escape(following['text']), source['text'])):
+                row.update(structural_role='numbered_list_marker', following_requirement_id=following['id'])
+        requirements.extend(source_rows)
     if not requirements:
         issues.append('No original requirements available; a continuation alone is not a specification')
     result = {'version':1, 'sources':sources, 'requirements':requirements,
-              'review_issues':sorted(set(issues)), 'request_attachments':refs}
+              'review_issues':sorted(set(issues)), 'request_attachments':refs,
+              'control_message_sources': control_sources}
     # Control messages and transcript growth must not invalidate acceptance.
     result['revision'] = digest({k:result[k] for k in ('sources','requirements','review_issues')})
     from project_requirement_lifecycle import apply

@@ -367,6 +367,7 @@ class ModelManager:
                    "--no-context-shift", "--host", "127.0.0.1", "--port", str(MODEL_PORT),
                    "--cors-origins", "localhost", "-lv", "4"]
         command += arguments(self.parameter_settings)
+        command += llama_engines.stability_arguments(info)
         if info.get('architecture') == 'clover_moe':
             command += ['--reasoning-format', 'deepseek', '--chat-template-file', str(executable.parent / 'clover-chat-template.jinja')]
         command += ["--spec-type", "draft-mtp", "--spec-draft-n-max", "3"] if config["mtp"] else ["--spec-type", "none"]

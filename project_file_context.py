@@ -3,6 +3,7 @@ import ast
 import difflib
 import hashlib
 import json
+from pathlib import Path
 import re
 import subprocess
 from project_source_index import javascript_index
@@ -76,6 +77,52 @@ def _definitions(text, suffix):
     pattern = re.compile(r'^\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?(?:function|class|interface|type|const|let|var)\s+([\w$]+)')
     return ([{'symbol': m[1], 'start_line': i + 1} for i, line in enumerate(text.splitlines())
              if (m := pattern.match(line))], 'lexical index; use line ranges to read bodies')
+
+
+class PatchMatchError(ValueError):
+    def __init__(self, path, text, old_text, sha256):
+        super().__init__('old_text must match exactly once; read the current file and choose a unique block')
+        old = old_text if isinstance(old_text, str) else ''
+        count = text.count(old) if old else 0
+        candidates = []
+        requested = re.search(r'\b(?:def|function|class)\s+([\w$]+)', old[:1000])
+        query = requested[1] if requested else None
+        if count:
+            at = 0
+            for _ in range(min(count, 3)):
+                at = text.index(old, at)
+                line = text.count('\n', 0, at) + 1
+                candidates.append({'matching_line': line, 'read_arguments': {
+                    'path': path, 'start_line': max(1, line - 3),
+                    'end_line': line + old.count('\n') + 3, 'max_chars': 4000}})
+                at += len(old)
+        else:
+            try:
+                rows, _ = _definitions(text, Path(path).suffix)
+            except (SyntaxError, ValueError, OSError, subprocess.TimeoutExpired):
+                rows = []
+            if query:
+                names = list(dict.fromkeys(row['symbol'].split('.')[-1] for row in rows))
+                selected = difflib.get_close_matches(query, names, n=3, cutoff=.35)
+                for name in selected:
+                    for row in rows:
+                        if row['symbol'].split('.')[-1] == name:
+                            candidates.append({'symbol': row['symbol'][:240], 'read_arguments': {
+                                'path': path, 'start_line': row['start_line'],
+                                'end_line': row.get('end_line', row['start_line']), 'max_chars': 4000}})
+                            if len(candidates) == 3:
+                                break
+                    if len(candidates) == 3:
+                        break
+        fallback = {'path': path, 'start_line': 1, 'max_chars': 4000}
+        self.patch_repair = {'path': path, 'current_sha256': sha256, 'match_count': count,
+            'requested_symbol': query[:240] if query else None,
+            'candidate_definitions': candidates, 'not_executed': True,
+            'next_call': {'tool': 'read_file', 'arguments': candidates[0]['read_arguments'] if candidates else fallback},
+            'next_action': 'The rejected snippet is absent or ambiguous. Read the suggested current ranges, '
+                'choose the intended definition, and copy a unique exact block from that read. '
+                'Candidates are discovery hints only: no fuzzy replacement, no read receipt, and no evidence of a successful edit. '
+                'Do not repeat the rejected patch. Existing stage retry limits still apply; reads do not reset them.'}
 
 
 def read_view(workspace, path, *, start_line=None, end_line=None, symbol=None,

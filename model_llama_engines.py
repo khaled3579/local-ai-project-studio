@@ -7,6 +7,18 @@ ROOT=Path(__file__).resolve().parent
 CLOVER=ROOT/'runtime/engines/clover-4838ffb'
 _VERIFIED=None
 
+
+def stability_arguments(model):
+    """Avoid native SWA checkpoint/prompt-cache restoration for GPT-OSS.
+
+    Windows native crashes were observed with the bundled 27c54b4-jsonfix4
+    runtime during alternating long prompts. Keep normal in-slot prefix reuse;
+    disable the optional RAM cache and checkpoint snapshots independently.
+    """
+    if model.get('architecture') == 'gpt-oss':
+        return ['--ctx-checkpoints', '0', '--cache-ram', '0']
+    return []
+
 def select(model, *, verified=True):
     global _VERIFIED
     if model.get('architecture')!='clover_moe':return ROOT/'runtime/llama-server.exe'

@@ -182,3 +182,67 @@ def apply_request(body, settings, *, allow_thought_suppression=False):
     if not allow_thought_suppression or thinking != 'off':
         body.pop('logit_bias', None)
     return body
+
+
+def validate_chat_effort(value):
+    """None inherits the manager policy; explicit effort is local to a job."""
+    if value is None or value == '':
+        return None
+    if not isinstance(value, str) or value not in GENERATION['reasoning_effort']['choices']:
+        raise ValueError('مستوى جهد التفكير غير صالح')
+    return value
+
+
+def apply_chat_effort(body, value):
+    effort = validate_chat_effort(value)
+    if effort is not None:
+        if effort == 'default':
+            body.pop('reasoning_effort', None)
+        else:
+            body['reasoning_effort'] = effort
+    return body
+
+
+def chat_effort_capabilities(props):
+    """Conservative allowlist from the loaded template, never from model names."""
+    import re
+    template = props.get('chat_template') or ''
+    if not isinstance(template, str):
+        template = ''
+    restrictions = re.findall(r"(?:resolved_)?reasoning_effort\s+not\s+in\s*[\(\[]([^\)\]]+)[\)\]]", template)
+    supported = None
+    for restriction in restrictions:
+        values = set(re.findall(r"['\"]([a-z]+)['\"]", restriction))
+        supported = values if supported is None else supported & values
+    harmony = (supported is None and
+               props.get('chat_template_caps', {}).get('supports_reasoning_effort') is True and
+               re.search(r'''["']Reasoning:\s*["']\s*\+\s*reasoning_effort''', template) is not None)
+    if harmony:
+        # Harmony's documented levels are low/medium/high. Its template emits
+        # the selected level directly instead of containing a rejection list.
+        supported = {'low', 'medium', 'high'}
+    choices = [v for v in GENERATION['reasoning_effort']['choices'] if v != 'default' and supported is not None and v in supported]
+    return {'choices': choices, 'verified': supported is not None,
+            'source': 'loaded_harmony_template' if harmony else 'loaded_template' if supported is not None else 'unknown'}
+
+
+def require_chat_effort(value, capabilities):
+    effort = validate_chat_effort(value)
+    if effort not in (None, 'default') and effort not in capabilities.get('choices', []):
+        allowed = ', '.join(capabilities.get('choices', [])) or 'إعداد النموذج الحالي'
+        raise ValueError('جهد التفكير غير مدعوم في النموذج الحالي. الخيارات المتاحة: ' + allowed)
+    return effort
+
+
+def update_checkpoint_effort(checkpoint, value, capabilities):
+    """Explicit resume override; preserve history, evidence and recovery limits."""
+    import time
+    effort = require_chat_effort(value, capabilities)
+    job = checkpoint['job']
+    previous = job.get('reasoning_effort')
+    if previous == effort:
+        return False
+    job.setdefault('reasoning_effort_changes', []).append(
+        {'previous': previous, 'selected': effort, 'time': time.time(), 'source': 'explicit_resume_request'})
+    job['reasoning_effort'] = effort
+    return True

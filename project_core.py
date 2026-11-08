@@ -22,9 +22,27 @@ from project_history import History, locked, recorded_command
 from project_command_output import command_result
 from app_maintenance import ensure_schema
 from project_validation import VERSION as VALIDATION_VERSION, COMMAND_ENV, python_tests, node_tests, node_syntax, tkinter_startup
-from project_file_context import read_view
+from project_file_context import read_view, PatchMatchError
 
 EXCLUDED = {".local-ai", ".venv", "venv", ".git", "node_modules", "__pycache__", ".pytest_cache"}
+
+def _flask_static_filename(ref):
+    """Resolve only a literal Flask static URL expression; never render/evaluate templates."""
+    match = re.fullmatch(r'\s*\{\{\s*(.*?)\s*\}\}\s*', ref, re.S)
+    if not match:
+        return None
+    try:
+        value = ast.parse(match.group(1), mode='eval').body
+    except (SyntaxError, ValueError):
+        return None
+    if (not isinstance(value, ast.Call) or not isinstance(value.func, ast.Name)
+            or value.func.id != 'url_for' or len(value.args) != 1
+            or not isinstance(value.args[0], ast.Constant) or value.args[0].value != 'static'
+            or len(value.keywords) != 1 or value.keywords[0].arg != 'filename'):
+        return None
+    filename = value.keywords[0].value
+    return filename.value if isinstance(filename, ast.Constant) and isinstance(filename.value, str) else None
+
 
 _SnapshotT = TypeVar('_SnapshotT')
 
@@ -139,7 +157,10 @@ class Workspace:
     def fingerprint(self, force=False):
         return _retry_missing_file(lambda: self._fingerprint_once(force))
 
-    def _fingerprint_once(self, force=False):
+    def fingerprint_snapshot(self):
+        return _retry_missing_file(lambda: self._fingerprint_once(True, include_files=True))
+
+    def _fingerprint_once(self, force=False, include_files=False):
         values = []
         for item in self.files():
             p = self.root / item["path"]
@@ -153,7 +174,8 @@ class Workspace:
                     digest = hashlib.file_digest(file, "sha256").hexdigest()
                 self.hash_cache[item["path"]] = (signature, digest)
             values.append((item["path"], digest))
-        return hashlib.sha256(json.dumps(values).encode()).hexdigest()
+        fingerprint = hashlib.sha256(json.dumps(values).encode()).hexdigest()
+        return (fingerprint, dict(values)) if include_files else fingerprint
 
     def read(self, path, **view):
         try:
@@ -283,11 +305,18 @@ class Workspace:
             html = self.path(item['path']); parser = Assets()
             parser.feed(html.read_text(encoding='utf-8-sig'))
             for ref in parser.refs:
-                url = urlsplit(ref)
-                if url.scheme or url.netloc or not url.path:
-                    continue
-                target = self.root / unquote(url.path).lstrip('/') if url.path.startswith('/') else html.parent / unquote(url.path)
-                if not target.resolve().is_relative_to(self.root) or not target.is_file():
+                filename = _flask_static_filename(ref)
+                if filename is not None:
+                    boundary = self.root / 'static'
+                    target = boundary / unquote(filename)
+                else:
+                    url = urlsplit(ref)
+                    if url.scheme or url.netloc or not url.path:
+                        continue
+                    boundary = self.root
+                    target = self.root / unquote(url.path).lstrip('/') if url.path.startswith('/') else html.parent / unquote(url.path)
+                if (not target.resolve().is_relative_to(self.root)
+                        or not target.resolve().is_relative_to(boundary.resolve()) or not target.is_file()):
                     missing.append({'html': item['path'], 'asset': ref})
         checks.append({'name': 'web_local_assets', 'passed': not missing, 'missing': missing})
         if not run_tests:
@@ -313,7 +342,7 @@ class Workspace:
     def validate(self,force=False,reason=None):
         if type(force) is not bool or force and (not isinstance(reason,str) or len(reason.strip())<10):
             raise ValueError('Forced repeated validation needs a concrete reason of at least 10 characters')
-        start_fingerprint = self.fingerprint(force=True)
+        start_fingerprint, start_files = self.fingerprint_snapshot()
         files = self.files()
         # A new failed/interrupted check must not leave a previous green report usable.
         self.validation_pending = True
@@ -367,7 +396,18 @@ class Workspace:
             from project_performance import performance_check
             checks.append(performance_check(self, contract) if all(c['passed'] for c in checks) else
                           {'name':'performance_contract','passed':False,'error':'Functional validation must pass before performance can be accepted.'})
-        final_fingerprint = self.fingerprint(force=True)
+        final_fingerprint, final_files = self.fingerprint_snapshot()
+        changed = [path for path in sorted(set(start_files) | set(final_files))
+                   if start_files.get(path) != final_files.get(path)]
+        if start_fingerprint != final_fingerprint:
+            checks.append({'name': 'validation_workspace_stability', 'passed': False,
+                'error': 'Project files changed during validation. Isolate test data/output in a temporary directory '
+                         'or a test-only database outside the delivered workspace; do not ignore these files or weaken acceptance.',
+                'changed_files': changed[:20], 'changed_file_count': len(changed),
+                'changed_files_truncated': len(changed) > 20,
+                'next_action': 'Inspect the test setup and the listed generated or modified files. '
+                               'Preserve project data and rerun validation only after fixing the cause. '
+                               'A passing assertion does not authorize delivery when the workspace changes.'})
         report = {"validator_version": VALIDATION_VERSION,
                   "timestamp": time.time(), "success": bool(checks) and all(c["passed"] for c in checks),
                   "checks": checks, "fingerprint": final_fingerprint, "source_unchanged_during_validation": start_fingerprint == final_fingerprint,
@@ -447,9 +487,10 @@ class Workspace:
         self.event("application_started", {"pid": self.running.pid, "entry": entry})
         return {"started": True, "pid": self.running.pid, "entry": entry, "log": ".local-ai/application.log"}
 
-    def stop(self):
-        if hasattr(self,'assistant_tools'):self.assistant_tools.browser.close()
-        if self.running and self.running.poll() is None:
+    def stop(self, *, close_tools=True):
+        was_running = bool(self.running and self.running.poll() is None)
+        if close_tools and hasattr(self,'assistant_tools'):self.assistant_tools.browser.close()
+        if was_running:
             import psutil
             process = psutil.Process(self.running.pid)
             children = process.children(recursive=True)
@@ -467,6 +508,10 @@ class Workspace:
         if self.run_log:
             self.run_log.close()
             self.run_log = None
+        if not close_tools:
+            return {'stopped':was_running,'already_stopped':not was_running,
+                    'diagnostic_browser_preserved':True,
+                    'next_action':'The application lifecycle is separate from browser_project. Use browser_project action=close only when intentionally ending its diagnostic session. Repeating stop_project does not repair a browser assertion.'}
         return {"stopped": True}
 
     @locked
@@ -479,7 +524,7 @@ class Workspace:
         if isinstance(old_text, str):old_text = old_text.replace('\r\n', '\n')
         if isinstance(new_text, str):new_text = new_text.replace('\r\n', '\n')
         if not isinstance(old_text,str) or not old_text or source.count(old_text)!=1:
-            raise ValueError('old_text must match exactly once; read the current file and choose a unique block')
+            raise PatchMatchError(value['path'], source, old_text, value['sha256'])
         if old_text==new_text:raise ValueError('Patch makes no change. Diagnose the failing behavior and provide a different replacement.')
         # An insertion may still contain its unique old block. Repeating it
         # with a newer receipt must not nest/duplicate an already-present edit.

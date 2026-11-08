@@ -3,14 +3,60 @@ import json
 import uuid
 import re
 import math
+from functools import lru_cache
+from pathlib import Path
 from project_context import inspection_guidance
 
 
-def output_budget(prompt, state, available):
+def output_budget(prompt, state, available, *, planning=False):
     """Reserve enough output for a requested single-file artifact, not input context."""
     single = bool(re.search(r'\bsingle[-\s]+(?:runnable\s+)?file\b|\bone\s+(?:runnable\s+)?file\b|ملف\s+واحد', str(prompt), re.I))
     requested = max(16384 if single else 4096, int(state.get('output_budget', 0)))
-    return max(256, min(32768, requested, int(available)))
+    return max(256, min(16384 if planning else 32768, requested, int(available)))
+
+
+def settle_output_budget(state, receipt, result):
+    """Retire only an internal truncation allowance after a measured small commit."""
+    if (not isinstance(receipt, dict) or not isinstance(result, dict)
+            or receipt.get('outcome') != 'complete'
+            or receipt.get('token_accounting_complete') is not True
+            or receipt.get('token_usage_source') != 'provider_usage'
+            or result.get('error') or result.get('not_executed')
+            or not isinstance(result.get('saved'), str) or not result.get('sha256')):
+        return False
+    count = receipt.get('completion_tokens')
+    budget = state.get('output_budget')
+    if (isinstance(count, bool) or not isinstance(count, int) or not 0 < count <= 4096
+            or isinstance(budget, bool) or not isinstance(budget, int) or budget <= 4096):
+        return False
+    state.pop('output_budget', None)
+    return True
+
+
+@lru_cache(maxsize=16)
+def _model_block_count(path, modified_ns, size):
+    # Header inspection is bounded and reads no tensor weights. The stat tuple
+    # prevents reusing metadata after a model file was replaced at the same path.
+    from model_library import inspect_gguf
+    info = inspect_gguf(path)
+    value = (info.get('metadata') or {}).get(info.get('architecture', '')+'.block_count')
+    return value if type(value) is int and value > 0 else None
+
+
+def cpu_layer_offload(state):
+    active = state.get('active') or {}
+    if state.get('engine', active.get('engine', 'llamacpp')) != 'llamacpp': return False
+    layers = ((active.get('parameters') or {}).get('runtime') or {}).get('gpu_layers')
+    if type(layers) is not int or layers < 0: return False
+    blocks = (state.get('model_info') or {}).get('block_count')
+    if type(blocks) is not int or blocks <= 0:
+        path = active.get('model')
+        if not isinstance(path, str) or not path.lower().endswith('.gguf'): return False
+        try:
+            stat = Path(path).stat()
+            blocks = _model_block_count(path, stat.st_mtime_ns, stat.st_size)
+        except (OSError, ValueError): return False
+    return type(blocks) is int and layers < blocks
 
 
 def generation_timeouts(input_tokens, output_tokens, *, model_state=None):
@@ -19,6 +65,11 @@ def generation_timeouts(input_tokens, output_tokens, *, model_state=None):
     initial = min(360, max(45, input_tokens / 600 + 15))
     state = model_state or {}
     active = state.get('active') or {}
+    if cpu_layer_offload(state):
+        # A cold long prompt with layers on CPU must not inherit the GPU-only
+        # 600 t/s assumption. This finite allowance is not a measured speed or
+        # liveness claim. Token silence after the first output stays unchanged.
+        initial = min(1800, max(initial, 60 + input_tokens / 128))
     if state.get('engine', active.get('engine')) == 'tabbyapi' and (
             active.get('cpu_split_experts') or active.get('cpu_offload_layers')):
         # CPU-expert prefill is much slower than GPU-only prompt processing.
@@ -26,6 +77,12 @@ def generation_timeouts(input_tokens, output_tokens, *, model_state=None):
         # This is a finite scheduling allowance, not a measured speed claim.
         initial = min(1800, max(120, 60 + input_tokens / 16))
     return initial, min(4500, max(240, initial + output_tokens / 8 + 30))
+
+
+def generation_http_timeout(total_timeout):
+    # The stream assembler owns idle and total cancellation. A shorter HTTP
+    # read timeout would abort legitimate cold prefill before that policy runs.
+    return (10, max(240, total_timeout + 30))
 
 
 class ActionFormatError(ValueError):
@@ -70,7 +127,7 @@ def json_messages(messages, tools):
         'For executable tools put ALL parameters inside arguments, never beside tool. '
         'FINAL IS DIFFERENT: {"tool":"final","message":"Arabic results"}; never nest the final message under arguments. '
         'For modular projects prefer compact files and split tests. Do not repeat completed actions. '
-        'Read current SHA before changing a file. Prefer patch_file for targeted repairs; do not rewrite a whole file for one bug. Fix reported failures without weakening tests. '
+        'Read current source before changing a file and use expected_sha256=@last_read; the host supplies the receipt. Prefer patch_file for targeted repairs; do not rewrite a whole file for one bug. Fix reported failures without weakening tests. '
         'Tool catalog: ' + json.dumps(catalog, ensure_ascii=False))
     result[0]['content'] += instruction
     return result
@@ -91,13 +148,13 @@ def action_format_feedback(error, tools, patch_targets=(), new_file_targets=()):
     focus = ((' Existing files requiring small-patch recovery: ' + json.dumps(list(patch_targets)) +
         '. Do NOT regenerate those complete files. Read only the relevant current selector/function/range, '
         'then patch ONE unique block at a time. Keep each old_text and new_text within 4000 characters. '
-        'Re-read after every saved patch to get the new SHA. Keep all existing behavior, requirements and tests. '
+        'Re-read the relevant current range when needed, then use expected_sha256=@last_read for the next patch. Keep all existing behavior, requirements and tests. '
         'For CSS, change one selector or coherent rule group per call; do not append a duplicate stylesheet. ')
         if patch_targets else '')
     if new_file_targets:
         focus += (' Large rejected creations: ' + json.dumps(list(new_file_targets)) +
             '. Do not regenerate the same oversized payload. Create a small, syntactically valid starting skeleton '
-            'of the SAME file with write_file, at most 4000 source characters. Then read its current SHA and '
+            'of the SAME file with write_file, at most 4000 source characters. Then read the current relevant source and use expected_sha256=@last_read to '
             'add one coherent section per patch_file call, with old_text and new_text each at most 4000 characters. '
             'A starting skeleton is not delivery: finish every original obligation and pass all delivery checks. '
             'Preserve the requested architecture and any single-file requirement; do not split required files. ')
@@ -182,8 +239,43 @@ def enforce_patch_recovery(name, arguments, generation_state, workspace):
         return
     if name == 'write_file':
         raise ValueError('Small-patch recovery: read the relevant current range and use patch_file on ONE unique block; do not regenerate this existing file.')
-    if any(len(arguments.get(key, '')) > 4000 for key in ('old_text', 'new_text')):
-        raise ValueError('Small-patch recovery: split this change into coherent patches; each old_text and new_text must be at most 4000 characters. Re-read current SHA after each patch.')
+    old, new = arguments.get('old_text', ''), arguments.get('new_text', '')
+    if max(len(old), len(new)) <= 4000:
+        return
+    # Remove shared context only if the shorter replacement is provably
+    # equivalent on the same source revision.
+    repair = {'path': path.relative_to(workspace.root).as_posix(),
+              'old_characters': len(old), 'new_characters': len(new),
+              'max_characters_per_field': 4000}
+    if old and arguments.get('expected_sha256') and old != new:
+        current = workspace.read(arguments['path'])
+        source = current['content'].replace('\r\n', '\n')
+        old, new = old.replace('\r\n', '\n'), new.replace('\r\n', '\n')
+        if (current['sha256'] == arguments['expected_sha256']
+                and source.count(old) == 1 and not (old in new and new in source)):
+            from os.path import commonprefix
+            prefix = len(commonprefix([old, new]))
+            suffix = len(commonprefix([old[prefix:][::-1], new[prefix:][::-1]]))
+            start = source.index(old) + prefix
+            repair.update(sha256=current['sha256'], line=source.count('\n', 0, start) + 1,
+                          excerpt=source[max(0, start - 180):start + 340])
+            if prefix + suffix == len(old):
+                if prefix:
+                    prefix -= min(prefix, 64)
+                else:
+                    suffix -= min(suffix, 64)
+            short_old = old[prefix:len(old)-suffix]
+            short_new = new[prefix:len(new)-suffix]
+            if (short_old and max(len(short_old), len(short_new)) <= 4000
+                    and source.count(short_old) == 1
+                    and source.replace(short_old, short_new, 1) == source.replace(old, new, 1)):
+                arguments.update(old_text=short_old, new_text=short_new)
+                return
+    error = ValueError(f'Small-patch recovery: {arguments["path"]} received old_text={len(old)} and new_text={len(new)} characters. '
+                       'Use the current line and SHA below when available. Change one section of at most 4000 characters per field. '
+                       'Do not resend this replacement.')
+    error.patch_repair = repair
+    raise error
 
 
 def action_schema(tools, repair=False, allow_final=True):
@@ -207,6 +299,37 @@ def sampler_grammar_failure(status, detail):
         'unexpected empty grammar stack' in text or 'failed to parse grammar' in text)
 
 
+def apply_format_recovery(body, state, model_state):
+    """Spend at most one request-local suppression allowance per rejection.
+
+    Old sticky flags expire on migration. Failure totals remain available to
+    the existing six-failure guard; a valid reply never clears that guard.
+    """
+    recovery = state.get('format_recovery') or {}
+    if not recovery.get('failures'):
+        return None
+    if recovery.get('suppression_version') != 1:
+        recovery.update(suppression_version=1, requests_remaining=0)
+        return 'legacy_expired'
+    if ((state.get('tool_compatibility') or {}).get('mode') != 'text'
+            or 'qwen' not in str((model_state.get('active') or {}).get('model', '')).lower()):
+        return None
+    if recovery.get('requests_remaining', 0) > 0:
+        body.setdefault('chat_template_kwargs', {})['enable_thinking'] = False
+        recovery['requests_remaining'] = 0
+        recovery['last_request_suppressed'] = True
+        return 'suppressed'
+    if recovery.pop('last_request_suppressed', False):
+        return 'configured_policy_restored'
+    return None
+
+
+def complete_format_recovery(state):
+    recovery = state.get('format_recovery')
+    if isinstance(recovery, dict) and recovery.get('failures'):
+        recovery.update(suppression_version=1, requests_remaining=0)
+
+
 def request_body(messages, tools, limit, *, protocol='native', attempt=0, repair=False, thought_token=None, allow_final=True, output_tokens=4096, tool_choice_auto=False, grammar_free=False):
     guidance = inspection_guidance(messages, tools)
     body = {'messages':messages, 'max_tokens':min(output_tokens, limit), 'stream':True,
@@ -225,7 +348,7 @@ def request_body(messages, tools, limit, *, protocol='native', attempt=0, repair
     if repair or not allow_final:
         body['messages']=[dict(m) for m in body['messages']]
         instruction='Give ONE brief observable diagnosis (JSON message field for JSON actions), then execute one targeted repair or diagnostic. Preserve tests. No long analysis, no placeholder output.'
-        if not allow_final:instruction+=' Validation is not yet passing: a final answer or a promise to act is not allowed. Execute the needed file creation, repair or diagnostic tool now.'
+        if not allow_final:instruction+=' Delivery requirements are not yet satisfied: a final answer or promise to act is not allowed. Execute the next host-directed implementation, diagnostic or evidence-collection operation now.'
         # Keep the immutable prompt prefix cacheable when repair mode changes.
         body['messages'].append({'role':'user','content':instruction})
     if guidance:
@@ -268,11 +391,60 @@ def validation_feedback(report):
     rows=[]
     for check in report.get('checks',[]):
         if check.get('passed'):continue
-        rows.append({k:check[k] for k in ('name','entry','error','errors','tests','tests_passed') if k in check})
+        rows.append({k:check[k] for k in ('name','entry','error','errors','tests','tests_passed',
+            'changed_files','changed_file_count','changed_files_truncated','next_action') if k in check})
         stdout,stderr=check.get('stdout') or '',check.get('stderr') or ''
         rows[-1]['diagnostic']=diagnostic_excerpt(stdout or stderr)
         if stdout and stderr:rows[-1]['stderr_diagnostic']=diagnostic_excerpt(stderr,3000)
-    return json.dumps({'success':report.get('success'),'failures':rows},ensure_ascii=False)
+    return json.dumps({'success':report.get('success'), 'fingerprint':report.get('fingerprint'),
+        'validation_current':report.get('current'), 'source_unchanged_during_validation':report.get('source_unchanged_during_validation'),
+        'failures':rows},ensure_ascii=False)
+
+
+def validation_handoff(report, max_chars=2200, current_fingerprint=None):
+    """Carry the latest unresolved diagnostic across context rotation, not old reads."""
+    if type(max_chars) is not int or max_chars < 600:
+        raise ValueError('Validation handoff budget must be at least 600 characters')
+    if not report:
+        return {'available': False, 'note': 'No recorded validation; no success is inferred.'}
+    failures = [row for row in report.get('checks', []) if row.get('passed') is not True]
+    # Put workspace instability first: otherwise passing assertions can mask
+    # why a validation is unusable. The complete report remains in the handoff.
+    ordered = sorted(failures, key=lambda row: row.get('name') != 'validation_workspace_stability')
+    rows = []
+    for row in ordered[:3]:
+        item = {'name': str(row.get('name', ''))[:100]}
+        if row.get('error'): item['error'] = str(row['error'])[:160]
+        diagnostic = diagnostic_excerpt(row.get('stdout') or row.get('stderr') or '', 400)
+        if diagnostic: item['diagnostic'] = diagnostic
+        if row.get('changed_files'):
+            item.update(changed_files=row['changed_files'][:2],
+                        changed_file_count=row.get('changed_file_count', len(row['changed_files'])))
+        rows.append(item)
+    value = {'available': True, 'success': report.get('success'), 'validation_current': report.get('current'),
+        'source_matches_current': report.get('fingerprint') == current_fingerprint if current_fingerprint and report.get('fingerprint') else None,
+        'fingerprint': report.get('fingerprint'), 'source_unchanged_during_validation': report.get('source_unchanged_during_validation'),
+        'failure_count': len(failures), 'failures': rows,
+        'details_omitted': True, 'full_report': 'read_continuation.validation',
+        'note': 'Latest recorded diagnostic, not authorization. If stale, do not replay old fixes. '
+                'Full report: read_continuation.validation; current disk report: .local-ai/last_validation.json.'}
+    while len(json.dumps(value, ensure_ascii=False)) > max_chars:
+        removable = next((row for row in reversed(rows) if 'diagnostic' in row), None)
+        if removable is not None:
+            removable.pop('diagnostic')
+        elif len(rows)>1:
+            rows.pop()
+        elif rows and 'error' in rows[0]:
+            rows[0].pop('error')
+        elif rows and len(rows[0].get('changed_files', []))>1:
+            rows[0]['changed_files'].pop()
+        elif 'note' in value:
+            value.pop('note')
+        elif rows and 'changed_files' in rows[0]:
+            rows[0].pop('changed_files')
+        else:
+            break
+    return value
 
 
 def missing_requested_sources(workspace, prompt):
@@ -320,6 +492,15 @@ def validate_action_value(value, schema, path='arguments', depth=0):
     """Validate the exposed tool-schema subset before grammar-free execution."""
     if depth > 64:
         raise ActionFormatError('Action nesting too deep')
+    if 'anyOf' in schema:
+        for option in schema['anyOf']:
+            try:
+                validate_action_value(value, option, path, depth + 1)
+                break
+            except ActionFormatError:
+                pass
+        else:
+            raise ActionFormatError(path + ': no allowed field combination; copy related values from the SAME row or action option shown in the tool schema')
     kind = schema.get('type')
     types = {'object': isinstance(value, dict), 'array': isinstance(value, list),
              'string': isinstance(value, str), 'integer': type(value) is int,
@@ -425,3 +606,75 @@ def decode_action(choice, tools, *, strict=False):
             '; unexpected='+json.dumps(sorted(set(args)-set(schema.get('properties',{})))))
     return {'finish_reason':'tool_calls', **({'protocol_adapter':adapter} if adapter else {}), 'message':{'role':'assistant','content':action.get('message',''),'tool_calls':[
         {'id':uuid.uuid4().hex,'type':'function','function':{'name':name,'arguments':json.dumps(args,ensure_ascii=False)}}]}}
+
+
+def recover_actionless_length(state, message, reasoning, previous_budget):
+    """Bound exhausted planning replies; never treat them as a file-writing task."""
+    calls = message.get('tool_calls') or []
+    if calls and all((call.get('function') or {}).get('name') in {'write_file', 'patch_file'} for call in calls):
+        return None
+    paragraphs = [re.sub(r'\s+', ' ', p).strip() for p in
+                  re.split(r'\n\s*\n', str(reasoning or '')[-64000:])]
+    counts = {}
+    for paragraph in paragraphs:
+        if len(paragraph) >= 160:
+            counts[paragraph] = counts.get(paragraph, 0) + 1
+    repeated = any(count >= 3 for count in counts.values())
+    rounds = int(state.get('actionless_length_rounds', 0)) + 1
+    state['actionless_length_rounds'] = rounds
+    state['output_budget'] = 4096 if repeated else min(16384, max(4096, int(previous_budget) * 2))
+    return {'pause': rounds >= 3, 'repeated': repeated, 'rounds': rounds,
+            'feedback': 'The previous response exhausted its output budget without a complete tool call. '
+            'No partial action was executed. Use the current host guidance and existing results; '
+            'return one COMPLETE tool call for the next required operation, with minimal planning. '
+            'Do not repeat the same plan, restart, or reread unchanged files. '
+            'Do not create or rewrite files merely because the output limit was reached. '
+            'For evidence work use link_acceptance_evidence with the exact IDs provided by the host; '
+            'if an ID is unknown, query that tool instead of guessing. '
+            'If implementation is actually needed, use a small complete targeted edit. '
+            'For project_plan on an existing plan, use update_stage for ONE current stage; do not regenerate the whole graph. '
+            'For an initial draft use append_stages for ONE small stage, then finalize_draft only after full coverage. '
+            'Read missing exact IDs with read_project_requirements pages. Do not generate a file as a substitute for saving the plan. '
+            'Preserve all acceptance criteria and prior evidence.'}
+
+
+def complete_actionless_recovery(state, message):
+    if message.get('tool_calls'):
+        state.pop('actionless_length_rounds', None)
+
+
+def recover_native_schema(state):
+    """Try JSON schema once after a native-parser failure, before free text."""
+    if state.get('native_schema_recovery_version') == 1:
+        return False
+    compatibility = state.get('tool_compatibility') or {}
+    state['tool_compatibility'] = {**compatibility, 'mode': 'auto', 'original_protocol': 'json'}
+    state['protocol'] = 'json'
+    state['native_schema_recovery_version'] = 1
+    return True
+
+
+def enforce_generation_route(choice, tools, allow_final=True):
+    """Enforce the offered phase for native and text fallback alike."""
+    if choice.get('finish_reason') == 'length':
+        return
+    calls = (choice.get('message') or {}).get('tool_calls') or []
+    if not calls and not allow_final:
+        raise ActionFormatError('Final response unavailable: the project plan is not ready for delivery. Execute the current host-directed tool step; do not promise completion or end the task.')
+    offered = {tool['function']['name']:tool['function'] for tool in tools}
+    for call in calls:
+        function = call.get('function') or {}
+        tool = offered.get(function.get('name'))
+        if tool is None:
+            raise ActionFormatError('Tool unavailable in the current evidence phase. Use only offered tools; preserve the existing plan and collect or link actual proof.')
+        try:
+            args = json.loads(function.get('arguments') or '{}')
+        except (ValueError,TypeError):
+            raise ActionFormatError('Tool arguments must be complete JSON') from None
+        fields = tool['parameters'].get('properties') or {}
+        if not isinstance(args,dict) or set(args)-set(fields):
+            raise ActionFormatError('Arguments unavailable in this phase; do not resend a stage graph while linking evidence.')
+        for key,value in args.items():
+            allowed = fields.get(key,{}).get('enum')
+            if allowed is not None and value not in allowed:
+                raise ActionFormatError('Invalid '+key+' in this phase; allowed='+json.dumps(allowed))

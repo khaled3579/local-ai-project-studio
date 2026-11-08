@@ -47,7 +47,7 @@ def excerpt(error):
     try:
         checks = json.loads(error)
         if isinstance(checks, list):
-            error = '\n'.join(str(c.get('stderr') or c.get('error') or c.get('stdout') or c) for c in checks)
+            error = '\n'.join(str(c.get('stderr') or c.get('error') or c.get('stdout') or c) if isinstance(c,dict) else str(c) for c in checks)
     except (ValueError, TypeError):
         pass
     return error[:2400]
@@ -65,6 +65,37 @@ class LoopGuard:
         for key, default in (('observations', []), ('changes', []), ('total', 0), ('last_alert', 0)):
             self.state.setdefault(key, default)
 
+    def bind_scope(self, workspace, hint):
+        """Keep old diagnostics, but retire their instructions after real progress."""
+        stage = (hint or {}).get('stage') or {}
+        path = workspace.meta / 'acceptance-plan.json'
+        raw = path.read_bytes() if path.is_file() else b''
+        try:
+            rows = json.loads(raw).get('items', []) if raw else []
+        except (ValueError, AttributeError):
+            rows = []  # Metadata validation still owns any corrupt-plan error.
+        existing = {row.get('criterion') for row in rows if isinstance(row,dict)
+                    and set(row.get('requirement_ids',[])) & set(stage.get('requirement_ids') or [])}
+        proof = stage.get('evidence') or {}
+        mapping_needed = (any(criterion not in existing for criterion in (stage.get('criteria') or []))
+            or bool(proof.get('missing_requirement_ids') and not proof.get('unmatched_criteria') and not proof.get('observable_gaps')))
+        payload = {'source':workspace.fingerprint(), 'stage':stage.get('id'),
+            'criteria':stage.get('criteria'), 'requirements':stage.get('requirement_ids'),
+            'acceptance':hashlib.sha256(raw).hexdigest() if raw else None}
+        scope = hashlib.sha256(json.dumps(payload,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+        self.state.update(active_scope=scope,scope_bound=True,acceptance_mapping_needed=mapping_needed)
+        return scope
+
+    def project_messages(self, messages):
+        """Only remove exact obsolete controller instructions from working context."""
+        if not self.state.get('scope_bound'):
+            return messages
+        obsolete = ['AUTOMATIC REPAIR PLAN CHANGE '+str(change['number'])+'\n'+change['plan']+'\nDo not repeat'
+                    for change in self.state['changes'] if change.get('scope') != self.state['active_scope']]
+        return [message for message in messages if not (message.get('role')=='user'
+            and isinstance(message.get('content'),str)
+            and any(message['content'].startswith(prefix) for prefix in obsolete))]
+
     def observe(self, name, arguments, result, fingerprint, step):
         """Called once per newly committed call, never for ledger cache hits."""
         if name=='browser_project' and isinstance(result.get('result'),dict):
@@ -76,6 +107,7 @@ class LoopGuard:
         action = digest(name + json.dumps(arguments, sort_keys=True, ensure_ascii=False))
         self.state['total'] += 1
         row = {'number': self.state['total'], 'step': step + 1, 'time': time.time(),
+               'scope':self.state.get('active_scope'),
                'tool': name, 'target': target, 'action': action, 'fingerprint': fingerprint,
                'outcome': 'failed' if error else 'not_executed' if result.get('not_executed') else 'waiting_for_user' if result.get('waiting_for_user') else 'completed',
                'error_signature': digest(error) if error else None, 'error_excerpt': excerpt(error)}
@@ -87,10 +119,11 @@ class LoopGuard:
         # in the user's source. Its bounded recovery belongs to the caller.
         if name == 'generation_loop':
             return None
-        recent = history[-12:]
+        scoped = [item for item in history if item.get('scope') == row['scope']]
+        recent = scoped[-12:]
         reason = None
         if error:
-            failures = [r for r in history if r['tool'] == name]
+            failures = [r for r in scoped if r['tool'] == name]
             streak = []
             for old in reversed(failures):
                 if old['error_signature'] != row['error_signature']:
@@ -104,10 +137,10 @@ class LoopGuard:
                 for old in tail:common.intersection_update(old.get('root_signatures', []))
                 if len(tail)==3 and common:reason='repeated_root_cause'
         same = [r for r in recent if r['action'] == action and r['fingerprint'] == fingerprint]
-        if not reason and len(history) >= 6:
+        if not reason and len(scoped) >= 6:
             for width in (2, 3):
                 repetitions = 3 if width == 2 else 2
-                window = history[-width * repetitions:]
+                window = scoped[-width * repetitions:]
                 keys = [(r['action'], r['fingerprint']) for r in window]
                 if len(window) == width * repetitions and len({r['fingerprint'] for r in window}) == 1 and all(keys[:width] == keys[i*width:(i+1)*width] for i in range(1,repetitions)):
                     reason = 'repeated_step_cycle'
@@ -127,8 +160,11 @@ class LoopGuard:
                                 or (c.get('name') == 'performance_contract' and c.get('error') == 'Functional validation must pass before performance can be accepted.')
                                 for c in result.get('checks', [])))
         patch_policy = error.startswith('Small-patch recovery:')
-        preserve_context = inspection or passing_command or passing_validation or quality_only or name in {'acceptance_plan','review_project_requirements'} or patch_policy
-        if patch_policy:
+        planning = name == 'project_plan' or result.get('next_tool') == 'project_plan'
+        preserve_context = planning or inspection or passing_command or passing_validation or quality_only or name in {'acceptance_plan','link_acceptance_evidence','review_project_requirements'} or patch_policy
+        if planning:
+            plan = 'Execution plan metadata needs attention. Use project_plan with its current revision. Save exact deliverable file paths, start a ready stage, or correct the named missing evidence. Preserve source and tests while the planning gate is closed. Do not repeat an unchanged rejected operation.'
+        elif patch_policy:
             plan = 'Small-patch recovery policy rejected this operation before execution. This is not a production defect. Preserve the context and implementation. Read the relevant current range, then patch ONE unique block with its current SHA. Split large changes into coherent patches and re-read after each commit. Do not regenerate the complete target file, reinstall dependencies, or weaken delivery gates.'
         elif inspection:
             plan = 'Inspection checkpoint only: preserve the current implementation, tests and task progress. A missing or ambiguous source path is not evidence of a production defect. Use the actual file inventory, the similar-path suggestions or a focused search to resolve the exact existing path. If this is a NEW requested deliverable, create it only within the original authorization. Do not repeat an unchanged failed read or invent a repair to working code. Continue the remaining original requirements using the evidence already captured.'
@@ -140,8 +176,11 @@ class LoopGuard:
             plan = 'Generated-test evidence repair only: functional checks passed, but the mandatory host quality contract did not. Preserve the passing implementation and original tests. Correct or complete the NEW test modules using the exact failed quality diagnostics and independent expected values, then validate. Do not replace production functions or drop a requirement to satisfy a defective or incomplete oracle. Quality and performance thresholds are unchanged.'
         elif name == 'review_project_requirements':
             plan = 'Requirement review metadata repair only: read source_requirements and revision, correct the reported uncovered ranges or use whole_source=true for an explicitly reviewed atomic block. Preserve all source text and semantic obligations. Do not rewrite passing source or rerun tests.'
-        elif name == 'acceptance_plan':
-            plan = 'Acceptance-link repair only: preserve every criterion and requirement group. Use the current repair_proposal and plan_revision with acceptance_plan(repair=true). For a behavioral typo review a relevant actual assertion and pass its exact ID in repairs. Do not rewrite or revalidate passing source, repeat zero queries, or replace whole requirement groups. A query is not an executed test.'
+        elif name in {'acceptance_plan', 'link_acceptance_evidence'}:
+            if self.state.get('acceptance_mapping_needed'):
+                plan = 'Acceptance coverage drafting: this stage still lacks stored criteria or original requirement coverage. Preserve every existing criterion and group. Read the scoped project_plan for exact requirements, review actual assertions, then add only relevant rows with acceptance_plan, complete=false and merge=true when a plan exists. link_acceptance_evidence repairs existing rows and cannot create the missing mappings; do not repeat empty link queries. Implement genuinely missing behavior/tests first, never attach unrelated IDs merely to advance.'
+            else:
+                plan = 'Acceptance-link repair only: preserve every criterion and requirement group. Read the current rows from link_acceptance_evidence and submit corrections through that tool. For a behavioral typo review a relevant actual assertion and pass its exact ID in repairs. Do not rewrite or revalidate passing source, repeat zero queries, or replace whole requirement groups. A query is not an executed test.'
         elif name == 'generation_limit':
             plan = 'The previous output was truncated and was not executed. Use the increased output budget for ONE complete file. Preserve any user-required single-file deliverable: if needed create a complete runnable skeleton, then add sections using targeted patch_file calls to that SAME file. For modular projects only, split independent modules or tests. Never resend the same truncated bulk write unchanged.'
         elif level == 0:
@@ -151,6 +190,7 @@ class LoopGuard:
         else:
             plan = 'Switch to dependency isolation: separate environment/harness failures from production logic with a minimal independent smoke test using existing installed tools. Verify paths/imports/runtime first, repair the actual failing layer in small files, then rerun original tests. Do not install unrelated dependencies or weaken tests.'
         change = {'number': len(self.state['changes']) + 1, 'step': step + 1, 'time': time.time(),
+                  'scope':self.state.get('active_scope'),
                   'reason': reason, 'trigger_tool': name, 'diagnostic': excerpt(error),
                   'recent_attempts': [{k:r.get(k) for k in ('number', 'step', 'tool', 'target', 'outcome', 'error_excerpt', 'fingerprint')} for r in history[-6:]],
                   'plan': plan, 'preserve_context':preserve_context, 'applied': False}
@@ -158,7 +198,8 @@ class LoopGuard:
         return change
 
     def apply_pending(self):
-        pending = [c for c in self.state['changes'] if not c['applied']]
+        pending = [c for c in self.state['changes'] if not c['applied']
+                   and (not self.state.get('scope_bound') or c.get('scope')==self.state['active_scope'])]
         if not pending:
             return None
         # All tool results in the preceding batch have already been appended.
@@ -170,6 +211,8 @@ class LoopGuard:
         if not self.state['changes']:
             return None
         latest = self.state['changes'][-1]
+        if self.state.get('scope_bound') and latest.get('scope') != self.state['active_scope']:
+            return None
         if self.passing_validation_plan(latest):
             return ('PASSING VALIDATION CHECKPOINT: Reuse the fresh validation receipt. '
                     'Complete only missing acceptance evidence or original deliverables, then report actual results. '

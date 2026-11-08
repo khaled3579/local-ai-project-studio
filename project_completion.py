@@ -10,6 +10,8 @@ def ready(studio,workspace,job,prompt,state):
     catalog=studio.requirements().catalog(studio.sessions)
     proof=host_evidence(workspace,state.get('acceptance_initial_tests',{}),job,browser=state.get('acceptance_browser'))
     acceptance=Acceptance(workspace,job.get('original_prompt',prompt),catalog=catalog,evidence=proof)
+    from project_work_plan import WorkPlan
+    if not WorkPlan(workspace, acceptance).read().get('ready_for_delivery'):return None
     if not acceptance.fresh(report) or not acceptance.mapping_status(report).get('ready_for_final_response'):return None
     if job.get('run_entry') and (not workspace.running or workspace.running.poll() is not None):return None
     if job.get('export') and job['export'].get('source_fingerprint')!=report['fingerprint']:return None

@@ -14,6 +14,49 @@ KINDS = {'behavior', 'unit', 'browser', 'host', 'context'}
 ID_PATTERN = r'R_[a-f0-9]{24}_\d+(?:_[a-f0-9]{12})?'
 
 
+def source_review_batch(catalog, character_limit=4800):
+    """Expose the next source review without requiring a prior passing validation."""
+    from project_acceptance import host_only_requirements
+    pending=set(catalog.get('pending_obligation_reviews', []))
+    blocks=[]
+    for row in catalog.get('source_requirements', []):
+        if row['id'] not in pending:
+            continue
+        original=row['text']
+        blocks.append({'requirement_id':row['id'], 'text':original[:1600],
+                       'text_truncated':len(original)>1600, 'source_length':len(original),
+                       'supported_host_evidence':host_only_requirements([row]).get(row['id'], [])})
+        if len(blocks)==8:
+            break
+    value={'catalog_revision':catalog.get('revision'), 'pending_source_reviews':len(pending),
+           'source_blocks':blocks, 'next_tool':'review_project_requirements' if pending else 'project_plan',
+           'next_action':'Read each original source. If explicitly reviewed as one atomic behavior, use review_atomic_requirement with requirement_id, reviewed_atomic=true, evidence_kind=behavior and expected_revision=catalog_revision. This single-row tool has no segments or host classification. For compound obligations use review_project_requirements with segments and omit whole_source. '
+               'Do not resend already saved blocks. Read full original text when truncated. Preserve every behavioral '
+               'obligation; context is only for eligible structural headings after explicit review. '
+               'While reviews remain, project_plan is unavailable. Finish only the shown source batch, then read the next batch with read_project_requirements. '
+               'When pending_source_reviews is zero, use project_plan append_stages to save ONE small stage per call covering at most 16 current IDs; '
+               'preserve saved stages and call finalize_draft only when draft.missing_count is zero. Never use save for a partial plan.'}
+    while len(json.dumps(value, ensure_ascii=False))>character_limit and len(blocks)>1:
+        blocks.pop()
+    value['shown_source_blocks']=len(blocks)
+    return value
+
+
+def observe_rejected_review(state, revision, result):
+    """Bound rejected review batches even before an execution plan exists."""
+    if result.get('saved'):
+        state.pop('source_review_rejections', None)
+        return False
+    if not result.get('error'):
+        return False
+    tracker = state.get('source_review_rejections') or {}
+    if tracker.get('revision') != revision:
+        tracker = {'revision': revision, 'failures': 0}
+        state['source_review_rejections'] = tracker
+    tracker['failures'] += 1
+    return tracker['failures'] >= 8
+
+
 class ReviewError(ValueError):
     def __init__(self,message,key,text,catalog):
         super().__init__(message+' [source requirement '+key+']')
@@ -57,9 +100,14 @@ def segment_bounds(text,segment):
 
 
 def classify(text):
+    from project_intent import continuation_request
+    if continuation_request(text):
+        return 'resume'
     value = plain(text).replace('أ','ا').replace('إ','ا').replace('آ','ا')
     if value in {plain(x) for x in ('أكمل','أكمل العمل','أكمل من حيث توقفت','استئناف السلسلة',
-            'استكمال السلسلة','تابع','متابعة','continue','resume','resume task','continue where you left off')}:
+            'استكمال السلسلة','تابع','متابعة','continue','resume','resume task','continue where you left off', 'أعد المحاولة السابقة', 'قمت برفع السياق أعد المحاولة السابقة')}:
+        return 'resume'
+    if re.fullmatch(r'(?:اعد|اع|كرر|اعادة) المحاولة مرة اخرى و?اكمل من حيث توقفت', value):
         return 'resume'
     if re.match(r'^(?:الغ|احذف المتطلب|cancel requirement|remove requirement)\b', value):
         return 'cancel'
@@ -74,6 +122,18 @@ def classify(text):
             or text.rstrip().endswith(('؟','?'))):
         return 'question'
     return 'add'
+
+
+def classify_request(request):
+    """New messages use a validated model decision; historical records retain fallback behavior."""
+    receipt=request.get('interpretation')
+    if not receipt:return classify(request['text'])
+    from project_message_intake import verified,requirement_text
+    intent=verified(request['text'],receipt)['intent']
+    if intent in {'continue','repair'}:return 'resume'
+    if intent in {'question','unclear'}:return 'question'
+    kind=classify(requirement_text(request))
+    return kind if kind in {'amend','cancel'} else 'add'
 
 
 def load(workspace):
@@ -92,7 +152,16 @@ def apply(workspace, catalog, requests):
     for source in result['source_requirements']:
         source['source_length'] = len(source['text'])
     active, pending, context = [], [], []
+    plan_path = safe_path(workspace, 'acceptance-plan.json')
+    plan = json.loads(plan_path.read_text(encoding='utf8')) if plan_path.exists() else {}
+    mapped_ids = {key for row in plan.get('items', []) for key in row.get('requirement_ids', [])}
     for block in catalog['requirements']:
+        # Existing reviewed mappings are retained verbatim. Only orphaned
+        # formatting prefixes are excluded from behavioral delivery gates.
+        if block.get('structural_role') == 'numbered_list_marker' and block['id'] not in mapped_ids:
+            context.append({**block, 'reason': 'Numbered list prefix; the following source block retains the obligation.',
+                            'following_requirement_id': block['following_requirement_id']})
+            continue
         review = ledger['reviews'].get(block['id'])
         if not review or review['source_sha256'] != digest(block['text']):
             pending.append(block['id'])
@@ -120,7 +189,7 @@ def apply(workspace, catalog, requests):
     # Chronology is the durable request order; references can only target predecessors.
     prior={}
     for request in requests:
-        kind=classify(request['text'])
+        kind=classify_request(request)
         new=by_request.get(request['id'],[])
         if kind in {'amend','cancel'}:
             mentioned=list(dict.fromkeys(re.findall(ID_PATTERN,request['text'])))
@@ -163,7 +232,7 @@ def apply(workspace, catalog, requests):
     result['retired_requirements']=[r for r in active if r['id'] in retired]
     result['relations']=relations
     result['pending_obligation_reviews']=pending
-    result['message_classifications']=[{'request_id':r['id'],'kind':classify(r['text']),'time':r.get('time'),
+    result['message_classifications']=[{'request_id':r['id'],'kind':classify_request(r),'time':r.get('time'),
                                        'session_id':r.get('session_id')} for r in requests]
     result['review_issues']=sorted(set(issues))
     result['review_ledger_revision']=digest(ledger)
@@ -171,9 +240,24 @@ def apply(workspace, catalog, requests):
     return result
 
 
-def review_segments(key,text,item):
+def source_numbered_heading(catalog, block):
+    """Recover lost Markdown structure, never infer headings from wording."""
+    source = next((r for r in catalog.get('sources', []) if r['id'] == block.get('source_id')), {})
+    text = block['text'].strip()
+    lines = [line.strip() for line in source.get('text', '').splitlines() if text in line]
+    pattern = r'#{1,6}\s+\d{1,3}\.\s+' + re.escape(text)
+    return bool(lines) and all(re.fullmatch(pattern, line) for line in lines)
+
+
+def review_segments(key,text,item, *, source_heading=False):
     covered=set()
-    if item.get('whole_source') is True:
+    # An explicit atomic review with a top-level kind already identifies the
+    # complete source. Accept the omitted shorthand flag, never explicit false
+    # or a mixed span/whole-source request.
+    implicit_whole = ('whole_source' not in item and 'segments' not in item
+                      and item.get('reviewed_atomic') is True
+                      and item.get('evidence_kind') in KINDS)
+    if item.get('whole_source') is True or implicit_whole:
         if 'segments' in item:
             raise ValueError('Choose whole_source or segments, never both')
         segments=[{'start':0,'end':len(text),'evidence_kind':item.get('evidence_kind')}]
@@ -198,7 +282,7 @@ def review_segments(key,text,item):
                 raise ValueError('Behavior cannot be replaced with host-only evidence')
         if kind=='context':
             snippet=text[start:end].strip()
-            structural=bool(re.fullmatch(r'(?:#{1,6}\s+[^\n]+|\*\*[^*\n]+\*\*:?)',snippet))
+            structural=bool(re.fullmatch(r'(?:#{1,6}\s+[^\n]+|\*\*[^*\n]+\*\*:?)',snippet)) or (source_heading and start == 0 and end == len(text))
             directive=re.search(r'\b(?:must|shall|required|implement|add|support|enable|يجب|يلزم|نفذ|اضف|دعم|انشاء)\b',plain(snippet))
             reason=segment.get('context_reason','')
             if not structural or directive or not isinstance(reason,str) or len(reason.strip())<20:
@@ -223,32 +307,81 @@ def review_segments(key,text,item):
 def review(requirements, *, expected_revision, items):
     catalog=requirements.catalog(persist=False)
     if catalog['revision'] != expected_revision:
-        raise ValueError('Requirements changed; re-read before reviewing')
+        selected = {item.get('requirement_id') for item in items if isinstance(item, dict)
+                    and isinstance(item.get('requirement_id'), str)} if isinstance(items, list) else set()
+        current = [row for row in catalog['source_requirements'] if row['id'] in selected]
+        error = ValueError('Requirements changed; use the current revision and review the affected source rows')
+        error.review_repair = {
+            'expected_revision': catalog['revision'], 'batch_saved': False,
+            'affected_count': len(selected),
+            'rows': [{'requirement_id': row['id'], 'text': row['text'][:800],
+                      'text_truncated': len(row['text']) > 800} for row in current[:6]],
+            'retired_or_unknown_ids': sorted(selected - {row['id'] for row in current})[:6],
+            'next_action': 'Review current exact text and resend only affected rows with the current revision. Read full text if truncated.',
+        }
+        raise error
     if not isinstance(items,list) or not 1 <= len(items) <= 40:
         raise ValueError('Review 1 to 40 source blocks per call')
     blocks={r['id']:r for r in catalog['source_requirements']}
+    invalid=[]; seen_ids=set()
+    for index, item in enumerate(items):
+        key=item.get('requirement_id') if isinstance(item,dict) else None
+        reason = ('missing_or_invalid_id' if not isinstance(key,str) else
+                  'unknown_source_id' if key not in blocks else
+                  'duplicate_source_id' if key in seen_ids else
+                  'atomicity_review_not_confirmed' if item.get('reviewed_atomic') is not True else None)
+        if reason:
+            invalid.append({'index':index,'requirement_id':key[:120] if isinstance(key,str) else None,'reason':reason})
+        if isinstance(key,str):seen_ids.add(key)
+    if invalid:
+        error=ValueError('Use each exact source ID once and confirm atomicity review; see invalid_rows. No rows were saved')
+        error.review_repair={'expected_revision':catalog['revision'],'batch_saved':False,
+            'invalid_rows':invalid,'next_source_batch':source_review_batch(catalog),
+            'next_action':'Correct the listed row indices using exact source IDs from next_source_batch. Do not invent or approximately match IDs. Keep other valid rows unchanged, confirm atomicity, then resend the complete corrected batch. No requirements or files were changed.'}
+        raise error
     ledger=load(requirements.workspace)
-    now=time.time(); updates={}
+    now=time.time(); updates={}; seen=set(); failures=[]
     for item in items:
         key=item['requirement_id']
-        if key in updates or key not in blocks or item.get('reviewed_atomic') is not True:
+        if key in seen or key not in blocks or item.get('reviewed_atomic') is not True:
             raise ValueError('Use each exact source ID once and confirm atomicity review')
+        seen.add(key)
         text=blocks[key]['text']
         try:
-            cleaned=review_segments(key,text,item)
+            cleaned=review_segments(key,text,item, source_heading=source_numbered_heading(catalog, blocks[key]))
         except (ValueError,KeyError,TypeError) as error:
-            raise ReviewError(str(error),key,text,catalog) from error
+            failures.append((key,text,error))
+            continue
         entry={'source_sha256':digest(text),'segments':cleaned,'time':now,
                'revision':digest([key,cleaned]),'reviewed_atomic':True}
+        updates[key]=entry
+    if failures:
+        key,text,cause=failures[0]
+        error=ReviewError(str(cause),key,text,catalog)
+        error.review_repair.update(
+            invalid_count=len(failures),
+            invalid_rows=[{'requirement_id':key,'error':str(cause)[:160]}
+                          for key,_,cause in failures],
+            valid_block_ids=list(updates),
+            next_action='Correct ALL invalid_rows in this batch after reviewing each original source. '
+                'Resend the complete batch with the same current revision; no rows were saved. '
+                'Keep the valid_block_ids unchanged. Non-heading obligations must remain behavioral/unit/browser '
+                'or supported host requirements; do not discard or automatically reclassify them as context. '
+                'Use the first-row example only after reviewing its atomicity. Preserve project code and tests.')
+        raise error from cause
+    # Commit the entire validated batch together, including its prior-review history.
+    for key,entry in updates.items():
         if key in ledger['reviews']:
             ledger['events'].append({'requirement_id':key,'previous':ledger['reviews'][key],'time':now})
-        updates[key]=entry
     ledger['reviews'].update(updates)
     path=safe_path(requirements.workspace,'requirement-reviews.json')
     atomic_json(path,ledger)
     result=requirements.catalog()
-    return {'saved':True,'reviewed_blocks':list(updates),'catalog_revision':result['revision'],
+    return {'saved':True,'reviewed_blocks':list(updates),
+            'resolved_pending_source_reviews':sorted(set(catalog.get('pending_obligation_reviews',[])) - set(result['pending_obligation_reviews'])),
+            'catalog_revision':result['revision'],
             'requirements':result['requirements'],
             'pending_obligation_reviews':result['pending_obligation_reviews'],
+            'next_source_batch':source_review_batch(result),
             'review_issues':result['review_issues'],
             'scope':'Source coverage checked; atomicity and semantic evidence relevance explicitly reviewed, not inferred by the host.'}

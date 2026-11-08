@@ -107,7 +107,7 @@ def host_only_row(owner, row):
 
 def proposal(owner, report):
     plan = owner.load()
-    coverage = owner.evaluate(report)
+    coverage = owner.evaluate(report, allow_partial=True)
     repairs = []
     known = list(dict.fromkeys(name for check in (report or {}).get('checks', [])
                  if check.get('passed') and check.get('validation_run_id') and check.get('executed', 0) > 0
@@ -148,15 +148,31 @@ def proposal(owner, report):
                       'Typed suite, performance, and preservation receipts are mandatory for their obligations; a similarly named test cannot substitute.'}
 
 
-def apply(owner, report, ticket, updates):
+def apply(owner, report, ticket, updates, *, recover_revision=False):
     from app_maintenance import atomic_json
     plan = owner.load()
     if not plan or not owner.fresh(report):
         raise ValueError('Link repair requires an existing plan and fresh successful validation; no files were changed')
-    if not isinstance(ticket, str) or ticket != revision(owner, report):
-        raise ValueError('Stale or missing plan_revision; read the current acceptance repair proposal. No files were changed')
     if not isinstance(updates, list) or len(updates) > 40:
         raise ValueError('repairs must be a list of at most 40 explicit row corrections')
+    current_revision = revision(owner, report)
+    refreshed = ticket != current_revision
+    if refreshed and (not recover_revision or updates):
+        error = ValueError('Stale or missing plan_revision; review the current row before resubmitting corrections. No files were changed')
+        error.acceptance_repair = {'plan_revision': current_revision, 'revision_changed': True,
+                                   'validation_current': True, 'saved': False}
+        if recover_revision:
+            wanted = {row.get('item_id') for row in updates if isinstance(row, dict)
+                      and isinstance(row.get('item_id'), str)}
+            error.acceptance_repair['current_rows'] = [
+                {'item_id': f'A{index}', 'criterion': row['criterion'][:400], 'tests': row['tests'][:3],
+                 'tests_truncated': len(row['tests']) > 3}
+                for index, row in enumerate(plan['items'], 1) if f'A{index}' in wanted][:3]
+            error.acceptance_repair['next_action'] = (
+                'Compare the current criterion and links with the intended correction. Then submit the reviewed correction with this exact plan_revision. '
+                'If the row or assertion is ambiguous, inspect the current plan or test before proceeding.')
+        raise error
+    ticket = current_revision
     proposed = proposal(owner, report)
     current = json.loads(json.dumps(plan))
     known = {name for row in report['checks'] if row.get('passed') and row.get('validation_run_id')
@@ -170,13 +186,17 @@ def apply(owner, report, ticket, updates):
         if not isinstance(update, dict) or set(update) != {'item_id','old_test','new_test'} or not all(isinstance(value, str) for value in update.values()):
             raise ValueError('Each correction requires string item_id, old_test, new_test only')
         key = (update['item_id'], update['old_test'])
-        if key in manual and manual[key] != update['new_test']:
+        additions = manual.setdefault(key, [])
+        if additions and update['new_test'] not in additions and update['old_test'] not in known | host:
             raise ValueError('Conflicting explicit corrections for the same row/link; no files were changed')
-        manual[key] = update['new_test']
+        # A current executed old link is preserved, so multiple distinct new
+        # links are complementary additions, not competing replacements.
+        if update['new_test'] not in additions:
+            additions.append(update['new_test'])
     automatic = [{'item_id': row['item_id'], 'old_test': item['old_test'], 'new_test': item['new_test']}
                  for row in proposed['repairs'] for item in row['automatic_replacements']
                  if (row['item_id'], item['old_test']) not in manual]
-    explicit = [{'item_id':key[0], 'old_test':key[1], 'new_test':new} for key,new in manual.items()]
+    explicit = [{'item_id':key[0], 'old_test':key[1], 'new_test':new} for key,news in manual.items() for new in news]
     for update in automatic + explicit:
         if not isinstance(update, dict) or set(update) != {'item_id','old_test','new_test'}:
             raise ValueError('Each correction requires item_id, old_test, new_test only')
@@ -205,7 +225,7 @@ def apply(owner, report, ticket, updates):
         row['tests'] = candidate['tests']
         touched.add(index)
         changes.append({'item_id':item_id, 'old_test':old, 'new_test':new, 'mode':mode})
-    items = owner.check_items(current['items'])
+    items = owner.check_items(current['items'], require_complete=not owner.catalog)
     preserve_rows(plan['items'], items)
     # References may be supplied by different corrections in the same row.
     # Evaluate the complete staged transaction, never an intermediate row.
@@ -227,8 +247,16 @@ def apply(owner, report, ticket, updates):
     current['items'] = items
     if current != plan:
         atomic_json(owner.path, current)
+    status = owner.mapping_status(report)
+    if status['ready_for_final_response']:
+        next_action = 'Deliver now; final host checks remain mandatory.'
+    elif status['unmapped_requirements']:
+        next_action = 'Continue the unmapped batch with acceptance_plan(items=..., complete=false, merge=true). Repair only specific invalid links; do not repeat an unchanged link repair.'
+    else:
+        next_action = 'Review the remaining explicit defects and provide row-specific corrections. Do not repeat this unchanged repair.'
     return {'saved': True, 'link_only_repair': True, 'changes': changes,
             'preserved_valid_links': preserved, 'unchanged': current == plan,
+            'revision_refreshed': refreshed,
             'plan_revision': revision(owner, report), 'validation_current': True,
-            'mapping_status': owner.mapping_status(report),
-            'next_action': 'Deliver now if ready_for_final_response; otherwise repair only the remaining explicit defects. Source files and tests were not edited.'}
+            'mapping_status': status, 'next_action': next_action,
+            'batch_diagnostics': owner.batch_diagnostics(report, status['unmapped_requirements'])}

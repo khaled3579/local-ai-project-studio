@@ -7,7 +7,7 @@ from pathlib import Path
 import uuid
 import ast
 
-VERSION = 7
+VERSION = 8
 COMMAND_ENV = ContextVar('project_validation_command_environment', default={})
 ROOT = Path(__file__).resolve().parent
 
@@ -146,7 +146,13 @@ def node_tests(workspace, argv, name):
     # Keep human-readable TAP output, and persist independent machine-readable counts.
     options += ' --test-reporter=tap --test-reporter=' + reporter
     options += ' --test-reporter-destination=stdout --test-reporter-destination=stdout'
-    with command_environment({'NODE_OPTIONS': options.strip(), 'LOCAL_AI_VALIDATION_DIRECTORY': str(directory),
+    browser_environment = {}
+    bundled_playwright = ROOT / 'runtime' / 'assistant' / 'node_modules' / 'playwright'
+    bundled_browsers = ROOT / 'runtime' / 'browser'
+    if bundled_playwright.is_dir() and bundled_browsers.is_dir():
+        browser_environment = {'PLAYWRIGHT_MODULE': os.environ.get('PLAYWRIGHT_MODULE', str(bundled_playwright)),
+            'PLAYWRIGHT_BROWSERS_PATH': os.environ.get('PLAYWRIGHT_BROWSERS_PATH', str(bundled_browsers))}
+    with command_environment({**browser_environment, 'NODE_OPTIONS': options.strip(), 'LOCAL_AI_VALIDATION_DIRECTORY': str(directory),
                               'LOCAL_AI_VALIDATION_RUN_ID': run_id, 'LOCAL_AI_VALIDATION_ROOT': str(workspace.root)}):
         result = workspace.command(argv, 120)
     check = {'name': name, **result, 'passed': False, 'tests': 0, 'executed': 0, 'tests_passed': 0,

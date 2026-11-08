@@ -1,5 +1,6 @@
 """Run a local service independently, retaining startup/native crash diagnostics."""
 import faulthandler
+import json
 from pathlib import Path
 import runpy
 import sys
@@ -20,6 +21,14 @@ def main():
         faulthandler.enable(file=log, all_threads=True)
         sys.argv = [str(target), *sys.argv[3:]]
         try:
+            policy_path = root / 'daily/service-cpu-policy.json'
+            if policy_path.exists():
+                policy = json.loads(policy_path.read_text(encoding='utf-8'))
+                if policy.get('mode') != 'efficiency':
+                    raise ValueError('Unknown process CPU policy')
+                from runtime_cpu_policy import apply_efficiency_policy
+                cpus = apply_efficiency_policy()
+                print('Process-local CPU isolation: logical CPUs ' + str(cpus), flush=True)
             runpy.run_path(str(target), run_name='__main__')
         except BaseException:
             traceback.print_exc(file=log)

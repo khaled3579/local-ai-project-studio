@@ -23,3 +23,12 @@ def task_mode(prompt, requested='auto'):
                  'ماذا يمكنك ان تفعل', 'ما الذي يمكنك فعله', 'مرحبا ماذا يمكنك ان تفعل',
                  'hello', 'hi', 'hey', 'what can you do', 'hello what can you do'}
     return 'chat' if text in greetings else 'project'
+
+
+def continuation_request(prompt):
+    """Recognize only complete workflow commands, never mixed product requests."""
+    text = ''.join(c for c in unicodedata.normalize('NFKD', prompt.casefold()) if not unicodedata.combining(c))
+    text = ' '.join(re.sub(r'[^\w\s]', ' ', text).split())
+    if text in {'continue','resume','resume task','continue where you left off','اكمل','اكمل العمل','اكمل من حيث توقفت','تابع','متابعة','استئناف السلسلة','استكمال السلسلة','قمت برفع السياق اعد المحاولة السابقة'}:
+        return True
+    return bool(re.fullmatch(r'(?:من فضلك |رجاء |قم ب)?(?:(?:اكمل|استكمل|تابع|واصل)(?: (?:بناء|تنفيذ|انشاء))? (?:المشروع|المهمة|العمل)(?: من حيث توقفت| حتى النهاية)?|(?:اعد|كرر|اعادة) المحاولة(?: السابقة| مرة اخرى)?(?: و?اكمل من حيث توقفت)?)', text))
