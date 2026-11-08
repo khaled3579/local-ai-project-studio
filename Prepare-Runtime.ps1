@@ -1,6 +1,7 @@
-param([switch]$SkipRecovery)
+﻿param([switch]$SkipRecovery)
 $ErrorActionPreference='Stop'
-$runtimeBase=(Get-Command python.exe -ErrorAction Stop).Source
+$runtimeBase=Join-Path $PSScriptRoot 'runtime\python\python.exe'
+if (-not (Test-Path -LiteralPath $runtimeBase)) { $runtimeBase=(Get-Command python.exe -ErrorAction Stop).Source }
 $runtimeVersion=& $runtimeBase -I -c 'import sys,struct;print(str(sys.version_info.major)+chr(46)+str(sys.version_info.minor)+chr(45)+str(struct.calcsize(chr(80))*8))'
 if ($runtimeVersion -ne '3.13-64') { throw 'Python 3.13 x64 is required.' }
 if (-not $SkipRecovery) {

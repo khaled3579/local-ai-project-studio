@@ -33,10 +33,10 @@ PROFILES = DATA / 'model-profiles.json'
 TOKEN = secrets.token_hex(24)
 CONTROL_PORT = 18079
 MODEL_PORT = 18080
-MODEL = r"G:\lm_studio_models\unsloth\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf"
+MODEL = str(ROOT / "models" / "select-model.gguf")
 MMPROJ = str(Path(MODEL).with_name("mmproj-F32.gguf"))
 DEFAULT = {"context": 8192, "mtp": True}
-LIBRARY = ModelLibrary(DATA / 'model-library.json', r'G:\lm_studio_models')
+LIBRARY = ModelLibrary(DATA / 'model-library.json', str(ROOT / 'models'))
 
 def validate(value, stored=False):
     if isinstance(value, dict) and value.get('engine', 'llamacpp') != 'llamacpp':

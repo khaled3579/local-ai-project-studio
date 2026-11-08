@@ -22,8 +22,8 @@ def release_path(root,name):
     if '\\' in name or not path.parts or path.parts[0].casefold() in FORBIDDEN or path.parts[0].startswith('.'):
         raise ValueError('الحزمة تحاول تغيير بيانات المستخدم أو مسارًا محظورًا')
     # Source files and the two declared dependency trees are the only release surface.
-    if len(path.parts)>1 and path.parts[0] not in {'runtime','wheelhouse'}:raise ValueError('مجلد غير مسموح في الحزمة')
-    if len(path.parts)==1 and path.suffix.lower() not in {'.py','.js','.cjs','.css','.html','.json','.txt','.ps1','.cmd'}:raise ValueError('نوع ملف غير مسموح')
+    if len(path.parts)>1 and path.parts[0] not in {'runtime','wheelhouse','docs','patches'}:raise ValueError('مجلد غير مسموح في الحزمة')
+    if len(path.parts)==1 and path.suffix.lower() not in {'.py','.js','.cjs','.css','.html','.json','.txt','.ps1','.cmd','.md','.patch'}:raise ValueError('نوع ملف غير مسموح')
     return contained(root,name)
 
 
@@ -32,7 +32,7 @@ def extract(package,sha,stage):
     if len(sha)!=64 or any(c not in '0123456789abcdef' for c in sha) or digest(package)!=sha:raise ValueError('بصمة ZIP غير مطابقة؛ لم يتغير التثبيت')
     with zipfile.ZipFile(package) as z:
         infos=z.infolist()
-        if len(infos)>15000 or sum(i.file_size for i in infos)>2*1024**3:raise ValueError('الحزمة تتجاوز حدود الإصدار')
+        if len(infos)>15000 or sum(i.file_size for i in infos)>4*1024**3:raise ValueError('الحزمة تتجاوز حدود الإصدار')
         names=[i.filename for i in infos]
         if len({n.casefold() for n in names})!=len(names):raise ValueError('مسارات مكررة في ZIP')
         if z.getinfo('APP-MANIFEST.json').file_size>4*1024*1024:raise ValueError('Manifest too large')
@@ -106,7 +106,7 @@ def snapshot_data(root,backup):
         from app_maintenance import ensure_schema
         ensure_schema(meta)
         targets += [(contained(meta,p.relative_to(meta).as_posix()),Path('project-meta')/p.relative_to(meta)) for p in meta.rglob('*') if p.is_file() and not p.name.endswith(('-wal','-shm'))]
-    if sum(p.stat().st_size for p,rel in targets)>2*1024**3:raise ValueError('نسخة البيانات أكبر من 2GB؛ لم تبدأ الترقية')
+    if sum(p.stat().st_size for p,rel in targets)>4*1024**3:raise ValueError('نسخة البيانات أكبر من 2GB؛ لم تبدأ الترقية')
     rows=[]
     for source,relative in targets:
         if source.is_symlink():raise ValueError('رابط داخل بيانات النسخة الاحتياطية')
